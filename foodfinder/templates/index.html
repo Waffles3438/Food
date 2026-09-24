@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#123e32">
+  <title>Free Food Finder · U of T</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Free Food Finder home">
+      <span class="brand-mark" aria-hidden="true">🥡</span>
+      <span><strong>Free Food Finder</strong><small>U of T · St. George</small></span>
+    </a>
+    <div class="top-actions">
+      <span id="sync-indicator" class="sync-indicator"><i></i><span>Getting things ready</span></span>
+      <button id="scan-now" class="button button-green" type="button"><span aria-hidden="true">↻</span> Scan now</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="welcome">
+      <div class="welcome-copy">
+        <p class="eyebrow">YOUR CAMPUS FOOD RADAR</p>
+        <h1>Good things are<br><span>on the menu.</span></h1>
+        <p class="welcome-desc">Find club events offering free food around St. George, all in one place.</p>
+      </div>
+      <div class="welcome-art" aria-hidden="true">
+        <span class="art-spark spark-one">✳</span><span class="art-spark spark-two">✦</span>
+        <span class="art-circle"></span><span class="art-plate">🍕</span>
+        <span class="art-leaf">✽</span>
+      </div>
+      <div class="welcome-footer"><span class="live-dot"></span> Scans while this app is open <span class="divider">·</span> about every 6 hours</div>
+    </section>
+
+    <section class="stats" aria-label="Scan summary">
+      <article class="stat-card"><span class="stat-icon icon-mint">✳</span><div><strong id="stat-upcoming">—</strong><span>Upcoming food events</span></div></article>
+      <article class="stat-card"><span class="stat-icon icon-yellow">◷</span><div><strong id="stat-clubs">—</strong><span>Club accounts found</span></div></article>
+      <article class="stat-card"><span class="stat-icon icon-lilac">✓</span><div><strong id="stat-checked">—</strong><span>Accounts checked</span></div></article>
+      <article class="stat-card"><span class="stat-icon icon-coral">?</span><div><strong id="stat-review">—</strong><span>Need a quick look</span></div></article>
+    </section>
+
+    <section class="content-panel" aria-label="Free food events">
+      <div class="panel-heading">
+        <div><p class="eyebrow">WHAT’S HAPPENING</p><h2>Food on the horizon</h2></div>
+        <span id="event-count" class="count-pill">0 events</span>
+      </div>
+      <nav class="tabs" aria-label="Event lists">
+        <button class="tab active" data-view="upcoming" type="button">Upcoming <span id="tab-upcoming">0</span></button>
+        <button class="tab" data-view="today" type="button">Today · time unknown <span id="tab-today">0</span></button>
+        <button class="tab" data-view="review" type="button">Needs review <span id="tab-review">0</span></button>
+      </nav>
+      <form id="filters" class="filters">
+        <label class="filter-field"><span>CLUB</span><select id="club-filter"><option value="">All clubs</option></select></label>
+        <label class="filter-field"><span>FROM</span><input id="from-filter" type="date"></label>
+        <label class="filter-field"><span>TO</span><input id="to-filter" type="date"></label>
+        <label class="check-field"><input id="free-entry" type="checkbox"><span>Free entry</span></label>
+        <label class="check-field"><input id="unrestricted-entry" type="checkbox"><span>Open to everyone</span></label>
+        <button class="button button-light" type="reset">Clear filters</button>
+      </form>
+      <div id="events" class="event-list" aria-live="polite">
+        <div class="loading-card"><span class="spinner"></span><span>Finding the good stuff…</span></div>
+      </div>
+    </section>
+
+    <section class="content-panel club-panel" id="clubs-section">
+      <div class="panel-heading club-heading">
+        <div><p class="eyebrow">COVERAGE &amp; HEALTH</p><h2>Clubs &amp; scans</h2><p class="panel-subtitle">The directory covers recognised groups; link missing Instagram accounts yourself.</p></div>
+        <div class="button-pair">
+          <button id="refresh-clubs" class="button button-light" type="button">↻ Refresh club list</button>
+          <button id="add-club" class="button button-outline" type="button">+ Add a club</button>
+        </div>
+      </div>
+      <div id="scan-banner" class="scan-banner"><span class="scan-banner-icon">◷</span><span id="scan-message">Club and account coverage will appear here.</span></div>
+      <form id="club-form" class="club-form hidden">
+        <input id="club-edit-id" type="hidden">
+        <label><span>CLUB NAME</span><input id="club-name" maxlength="180" required placeholder="e.g. The Baking Club"></label>
+        <label><span>INSTAGRAM HANDLE</span><div class="handle-input"><span>@</span><input id="club-username" maxlength="30" placeholder="bakingclubuoft"></div></label>
+        <label><span>CLUB WEBSITE (OPTIONAL)</span><input id="club-website" type="url" placeholder="https://example.com"></label>
+        <div class="form-actions"><button class="button button-light" id="cancel-club" type="button">Cancel</button><button class="button button-green" type="submit">Save club</button></div>
+      </form>
+      <div class="club-tools"><label class="search-clubs"><span aria-hidden="true">⌕</span><input id="club-search" type="search" placeholder="Find a club" autocomplete="off"></label><span id="club-directory-count" class="muted"></span></div>
+      <div id="clubs" class="club-list"></div>
+      <p class="footnote">Instagram access depends on the account and your login session. We mark interrupted checks so you can see where coverage has gaps.</p>
+    </section>
+
+    <footer class="footer"><span>Made for students who ask <em>“is there free food?”</em></span><span>All dates in Toronto time · Club posts may change</span></footer>
+  </main>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
