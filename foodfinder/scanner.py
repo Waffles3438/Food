@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from foodfinder.database import connect, initialize, link_club_account, upsert_club, utcnow
 from foodfinder.discovery import Club, fetch_myutsu_clubs, fetch_sop_clubs, merge_directory_clubs
-from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events
+from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events, _extract_dates
 from foodfinder.instagram import MediaSource, _make_loader, collection_error_detail, collection_failure_kind, iter_account_sources
 from foodfinder.retry import retry_plan
 from foodfinder.settings import DISCOVERY_INTERVAL_DAYS, POST_LIMIT, POST_AGE_DAYS
@@ -121,6 +121,8 @@ def _update_source(db: sqlite3.Connection, account_id: str, source: MediaSource)
          source.media_text, source.posted_at, source.expires_at, blob, utcnow()),
     )
     row = db.execute("SELECT id FROM sources WHERE account_id=? AND source_key=?", (account_id, source.source_key)).fetchone()
+    db.execute("UPDATE sources SET cache_version=?,ocr_complete=? WHERE id=?",
+               (0 if source.collection_warning else 1, int(source.ocr_complete), row["id"]))
     return str(row["id"])
 
 
@@ -178,7 +180,8 @@ def _apply_candidate(
         )
 
     if candidate.event_date and candidate.status == "upcoming":
-        possible = _existing_for_clubs(db, account_id, candidate.event_date)
+        possible = [row for row in _existing_for_clubs(db, account_id, candidate.event_date)
+                    if row["source_id"] != source_id]
         duplicate_id = deduplicate_candidate(possible, candidate)
         if duplicate_id:
             # Use the earliest event id as the canonical entry and retain every announcement.
@@ -234,9 +237,9 @@ def _apply_candidate(
 
 def process_source(db_path: Path | str | None, account_id: str, account_name: str, source: MediaSource) -> int:
     text = "\n".join(part for part in (source.caption, source.media_text) if part.strip())
-    if not text:
-        return 0
-    candidates = extract_events(text, posted_at=source.posted_at, account_name=account_name)
+    posted = datetime.fromisoformat(source.posted_at.replace("Z", "+00:00"))
+    date_text = source.caption if _extract_dates(source.caption, posted, datetime.now(TORONTO)) else text
+    candidates = extract_events(text, posted_at=source.posted_at, account_name=account_name, date_text=date_text)
     if source.kind == "story" and not candidates and source.evidence_path:
         source = replace(source, evidence_path="")
     with connect(db_path) as db:
@@ -260,6 +263,12 @@ def process_source(db_path: Path | str | None, account_id: str, account_name: st
             if row["event_key"] in seen_keys:
                 continue
             overrides = json.loads(row["manual_overrides_json"] or "{}")
+            # Replaced automatic detections should not remain as extra cards.
+            # Keep manually reviewed rows and events supported by other posts.
+            other_evidence = db.execute("SELECT 1 FROM evidence WHERE event_id=? AND source_id<>?", (row["id"], source_id)).fetchone()
+            if candidates and not overrides and not other_evidence:
+                db.execute("UPDATE events SET status='duplicate',updated_at=? WHERE id=?", (utcnow(), row["id"]))
+                continue
             if "review_reason" in overrides or "status" in overrides:
                 continue
             db.execute(
@@ -349,7 +358,12 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 checked = 0
                 truncated = False
                 warnings: set[str] = set()
-                for source in iter_account_sources(username, loader=loader):
+                with connect(db_path) as db:
+                    saved_sources = {row["source_key"]: dict(row) for row in db.execute(
+                        "SELECT source_key,caption,media_text,cache_version,ocr_complete FROM sources WHERE account_id=?",
+                        (account_id,),
+                    )}
+                for source in iter_account_sources(username, loader=loader, saved_sources=saved_sources):
                     if source.collection_warning:
                         warnings.add(source.collection_warning)
                     if source.truncated:
@@ -450,34 +464,45 @@ def launch_scan(db_path: Path | str | None = None, *, force_discovery: bool = Fa
     return "started"
 
 
+def _event_rows(db, ids, *, summary=False):
+    results = []
+    for offset in range(0, len(ids), 500):
+        batch = ids[offset:offset + 500]
+        marks = ",".join("?" for _ in batch)
+        fields = "e.id,e.title,e.event_date" if summary else "e.*,s.kind AS source_kind,s.url AS source_url,s.caption,s.media_text,s.posted_at,s.expires_at,a.username"
+        rows = db.execute(f"""SELECT {fields}, GROUP_CONCAT(DISTINCT c.name) AS club_names
+            FROM events e JOIN sources s ON s.id=e.source_id JOIN accounts a ON a.id=s.account_id
+            LEFT JOIN club_accounts ca ON ca.account_id=a.id LEFT JOIN clubs c ON c.id=ca.club_id
+            WHERE e.id IN ({marks}) GROUP BY e.id""", batch).fetchall()
+        evidence = {}
+        if not summary:
+            for row in db.execute(f"""SELECT DISTINCT ev.event_id,s.url,s.kind,s.posted_at,s.expires_at,a.username,ev.excerpt
+                FROM evidence ev JOIN sources s ON s.id=ev.source_id JOIN accounts a ON a.id=s.account_id
+                WHERE ev.event_id IN ({marks}) ORDER BY s.posted_at DESC""", batch):
+                item = dict(row)
+                evidence.setdefault(item.pop("event_id"), []).append(item)
+        by_id = {}
+        for row in rows:
+            result = dict(row)
+            if not summary:
+                result["manual_overrides"] = json.loads(result.pop("manual_overrides_json") or "{}")
+                result["food_confidence_label"] = result["food_confidence"].title()
+                result["entry_paid"] = bool(result["entry_cost"] and result["entry_cost"] != "Free entry")
+                result["supporting_sources"] = evidence.get(result["id"], [])
+            by_id[result["id"]] = result
+        results.extend(by_id[ident] for ident in batch if ident in by_id)
+    return results
+
+
 def get_event(event_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
     with connect(db_path) as db:
-        row = db.execute(
-            """SELECT e.*, s.kind AS source_kind, s.url AS source_url, s.caption, s.media_text,
-               s.posted_at, s.expires_at, s.media_blob, a.username,
-               GROUP_CONCAT(DISTINCT c.name) AS club_names
-               FROM events e JOIN sources s ON s.id=e.source_id JOIN accounts a ON a.id=s.account_id
-               LEFT JOIN club_accounts ca ON ca.account_id=a.id LEFT JOIN clubs c ON c.id=ca.club_id
-               WHERE e.id=? GROUP BY e.id""",
-            (event_id,),
-        ).fetchone()
-        if not row:
-            return None
-        result = dict(row)
-        result["manual_overrides"] = json.loads(result.pop("manual_overrides_json") or "{}")
-        result["food_confidence_label"] = result["food_confidence"].title()
-        result["entry_paid"] = bool(result["entry_cost"] and result["entry_cost"] != "Free entry")
-        result["supporting_sources"] = [
-            dict(evidence)
-            for evidence in db.execute(
-                """SELECT DISTINCT s.url,s.kind,s.posted_at,s.expires_at,a.username,ev.excerpt
-                   FROM evidence ev JOIN sources s ON s.id=ev.source_id
-                   JOIN accounts a ON a.id=s.account_id WHERE ev.event_id=? ORDER BY s.posted_at DESC""",
-                (event_id,),
-            ).fetchall()
-        ]
-        result.pop("media_blob", None)
-        return result
+        rows = _event_rows(db, [event_id])
+    return rows[0] if rows else None
+
+
+def event_counts(db_path=None):
+    return {view: len(list_events(view=view, db_path=db_path, _summary=True))
+            for view in ("upcoming", "today", "review")}
 
 
 def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None = None) -> dict[str, Any] | None:
@@ -521,6 +546,7 @@ def list_events(
     free_entry: bool = False,
     unrestricted_entry: bool = False,
     db_path: Path | str | None = None,
+    _summary: bool = False,
 ) -> list[dict[str, Any]]:
     today = datetime.now(TORONTO).date().isoformat()
     clauses = ["e.status NOT IN ('cancelled','dismissed','duplicate')"]
@@ -558,12 +584,10 @@ def list_events(
     )
     with connect(db_path) as db:
         ids = [row["id"] for row in db.execute(query, params)]
+        event_rows = _event_rows(db, ids, summary=_summary)
     seen: set[tuple[str, str, str]] = set()
     results: list[dict[str, Any]] = []
-    for ident in ids:
-        result = get_event(str(ident), db_path)
-        if not result:
-            continue
+    for result in event_rows:
         key = (result["title"].casefold(), result["event_date"], "|".join(sorted((result.get("club_names") or "").split(","))))
         if key in seen:
             continue

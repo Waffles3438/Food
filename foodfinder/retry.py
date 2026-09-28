@@ -21,7 +21,7 @@ def failure_kind(run) -> str:
     if message.startswith("Previous app session ended during this scan;"):
         return "interrupted"
     if "did not return readable account data" in message:
-        return "access"  # Unknown legacy failure: keep the longer delay.
+        return "access"
     return ""
 
 
@@ -30,26 +30,23 @@ def retry_plan(db_path, now=None) -> dict:
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     with connect(db_path) as db:
-        runs = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 4").fetchall()
+        runs = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchall()
     empty = {"next_scan_at": "", "requires_login": False, "cooldown": False, "reason": ""}
     if not runs or runs[0]["status"] == "running" or not runs[0]["finished_at"]:
         return empty
     latest = runs[0]
     kind = failure_kind(latest)
-    if kind == "authentication":
-        return {**empty, "requires_login": True, "reason": "Login needs attention. Reimport the browser session, then select Scan now."}
+    failed = bool(kind) or latest["status"] in {"partial", "error"}
     minutes = SCAN_INTERVAL_HOURS * 60
     reason = "Next scheduled scan"
-    if kind in {"connection", "response"}:
-        streak = 0
-        for run in runs:
-            if failure_kind(run) not in {"connection", "response"}:
-                break
-            streak += 1
-        minutes = (5, 15, 30, max(30, SCAN_INTERVAL_HOURS * 60))[min(streak, 4) - 1]
-        reason = "Automatic retry after a temporary Instagram failure"
-    elif kind in {"access", "rate_limit", "temporary_limit", "interrupted"}:
-        reason = "Automatic retry after the longer scan cooldown"
+    if kind == "rate_limit":
+        minutes = 6 * 60
+        reason = "Automatic retry after the six-hour HTTP 429 cooldown"
+    elif failed:
+        minutes = 5
+        reason = "Automatic retry after the five-minute failure cooldown"
+        if kind == "authentication":
+            reason = "Login needs attention; reimport the browser session if needed. Automatic retry"
     try:
         finished = datetime.fromisoformat(latest["finished_at"])
     except ValueError:
@@ -58,5 +55,5 @@ def retry_plan(db_path, now=None) -> dict:
     if finished.tzinfo is None:
         finished = finished.replace(tzinfo=timezone.utc)
     due = finished + timedelta(minutes=minutes)
-    return {"next_scan_at": due.isoformat(), "requires_login": False,
-            "cooldown": bool(kind) and current < due, "reason": reason}
+    return {"next_scan_at": due.isoformat(), "requires_login": kind == "authentication",
+            "cooldown": failed and current < due, "reason": reason}

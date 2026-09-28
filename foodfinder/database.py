@@ -140,6 +140,10 @@ def initialize(db_path: Path | str | None = None) -> None:
         if "eligibility" not in existing_event_columns:
             db.execute("ALTER TABLE events ADD COLUMN eligibility TEXT NOT NULL DEFAULT ''")
         scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scan_runs)")}
+        source_columns = {row["name"] for row in db.execute("PRAGMA table_info(sources)")}
+        for name in ("cache_version", "ocr_complete"):
+            if name not in source_columns:
+                db.execute(f"ALTER TABLE sources ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
         for name in ("failure_kind", "error_detail"):
             if name not in scan_columns:
                 db.execute(f"ALTER TABLE scan_runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")

@@ -45,7 +45,7 @@ TIME_PATTERN = re.compile(
 )
 DATE_FALLBACK = re.compile(
     r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
-    r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b",
+    r"Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b",
     re.I,
 )
 DATE_TOKEN = re.compile(
@@ -260,6 +260,9 @@ def _valid_food_claim(text: str) -> re.Match[str] | None:
 
 
 def _extract_times(text: str) -> list[str]:
+    text = re.sub(r"\b(\d{1,2})[.]([0-5]\d)\s*(am|pm)\b", r"\1:\2\3", text, flags=re.I)
+    text = re.sub(r"\b(\d{1,2})(?::(\d{2}))?\s*[-–]\s*(\d{1,2}(?::\d{2})?)\s*(am|pm)\b",
+                  lambda m: f"{m[1]}{(':' + m[2]) if m[2] else ''}{m[4]}-{m[3]}{m[4]}", text, flags=re.I)
     found: list[str] = []
     for m in TIME_PATTERN.finditer(text):
         if m.group(1):
@@ -283,47 +286,28 @@ def _extract_dates(text: str, posted_at: datetime, now: datetime) -> list[tuple[
         base = base.replace(tzinfo=timezone.utc)
     local_base = base.astimezone(TORONTO)
     parsed: list[tuple[date, str]] = []
-    try:
-        from dateparser.search import search_dates
-
-        results = search_dates(
-            text,
-            languages=["en"],
-            settings={
-                "RELATIVE_BASE": local_base,
-                "TIMEZONE": "America/Toronto",
-                "TO_TIMEZONE": "America/Toronto",
-                "RETURN_AS_TIMEZONE_AWARE": True,
-                "PREFER_DATES_FROM": "current_period",
-                "DATE_ORDER": "MDY",
-                "STRICT_PARSING": True,
-            },
-        ) or []
-        for fragment, dt in results:
-            if not isinstance(dt, datetime):
+    # Only explicit calendar expressions; durations are not event dates.
+    for match in DATE_FALLBACK.finditer(text):
+        if re.search(r"\b(?:published|since|copyright)\s*$", text[max(0, match.start()-30):match.start()], re.I):
+            continue
+        fragment = match.group()
+        cleaned = re.sub(r"(\d)(?:st|nd|rd|th)", r"\1", fragment, flags=re.I)
+        cleaned = re.sub(r"\bSept\b", "Sep", cleaned, flags=re.I)
+        if not re.search(r"\b\d{4}\b", cleaned):
+            cleaned += f" {local_base.year}"
+        for fmt in ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
+            try:
+                parsed.append((datetime.strptime(cleaned, fmt).date(), fragment))
+                break
+            except ValueError:
                 continue
-            if not DATE_TOKEN.search(fragment):
+    for match in re.finditer(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b", text):
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                parsed.append((datetime.strptime(match.group(), fmt).date(), match.group()))
+                break
+            except ValueError:
                 continue
-            local_dt = dt.astimezone(TORONTO) if dt.tzinfo else dt.replace(tzinfo=TORONTO)
-            if (local_dt.date(), fragment.lower()) not in [(d, f.lower()) for d, f in parsed]:
-                parsed.append((local_dt.date(), fragment))
-    except (ImportError, ValueError, OverflowError):
-        # The deterministic fallback makes core extraction usable during minimal installs.
-        pass
-    if not parsed:
-        for match in DATE_FALLBACK.finditer(text):
-            fragment = match.group(0)
-            cleaned = re.sub(r"(\d)(?:st|nd|rd|th)", r"\1", fragment, flags=re.I)
-            formats = ("%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y", "%B %d", "%b %d")
-            for fmt in formats:
-                try:
-                    parsed_date = datetime.strptime(cleaned, fmt).date()
-                    if "%Y" not in fmt:
-                        parsed_date = parsed_date.replace(year=local_base.year)
-                    parsed.append((parsed_date, fragment))
-                    break
-                except ValueError:
-                    continue
     if not parsed:
         relative = re.search(r"\b(today|tonight|tomorrow|yesterday)\b", text, re.I)
         if relative:
@@ -349,7 +333,7 @@ def _extract_dates(text: str, posted_at: datetime, now: datetime) -> list[tuple[
             parsed.append((local_base.date() + timedelta(days=delta), weekday_pattern.group(0).strip()))
     unique: list[tuple[date, str]] = []
     for event_day, fragment in parsed:
-        if (event_day, fragment.lower()) not in [(d, f.lower()) for d, f in unique]:
+        if event_day not in [d for d, _ in unique]:
             unique.append((event_day, fragment))
     return unique[:5]
 
@@ -376,6 +360,7 @@ def extract_events(
     posted_at: datetime | str,
     account_name: str,
     now: datetime | None = None,
+    date_text: str | None = None,
 ) -> list[EventCandidate]:
     """Find independently dated food events; ambiguous claims go to review."""
     if isinstance(posted_at, str):
@@ -396,7 +381,11 @@ def extract_events(
     vague_match = VAGUE_FOOD_PATTERN.search(full)
     if not food_match and not vague_match and not cancelled and not negative_food:
         return []
-    dates = _extract_dates(full, posted_at, now_local)
+    date_evidence = full if date_text is None else date_text
+    food_paragraphs = [part for part in re.split(r"\n\s*\n", date_evidence)
+                       if _valid_food_claim(part) or VAGUE_FOOD_PATTERN.search(part)]
+    food_dates = _extract_dates("\n".join(food_paragraphs), posted_at, now_local) if food_paragraphs else []
+    dates = food_dates or _extract_dates(date_evidence, posted_at, now_local)
     if not cancelled and not food_match and not EVENT_CUE.search(full) and not dates:
         return []
     times = _extract_times(full)

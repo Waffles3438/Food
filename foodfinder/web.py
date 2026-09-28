@@ -20,6 +20,7 @@ from foodfinder.progress import configure_progress_logging, report
 from foodfinder.retry import retry_plan
 from foodfinder.scanner import (
     get_event,
+    event_counts,
     launch_scan,
     list_clubs,
     list_events,
@@ -143,7 +144,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
         )
 
     @app.get("/api/events")
-    async def events(
+    def events(
         view: str = Query("upcoming", pattern="^(upcoming|review|today)$"),
         club: str = "",
         from_date: str = "",
@@ -167,6 +168,10 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
             db_path=database,
         )
 
+    @app.get("/api/event-counts")
+    def counts():
+        return event_counts(database)
+
     @app.get("/api/events/{event_id}")
     async def event_detail(event_id: str):
         result = get_event(event_id, database)
@@ -175,7 +180,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
         return result
 
     @app.patch("/api/events/{event_id}")
-    async def event_review(event_id: str, patch: dict[str, Any]):
+    def event_review(event_id: str, patch: dict[str, Any]):
         try:
             result = patch_event(event_id, patch, database)
         except ValueError as exc:

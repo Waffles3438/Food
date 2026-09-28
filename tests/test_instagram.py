@@ -56,7 +56,7 @@ class TimelineTests(unittest.TestCase):
         self.profile_lookup = self.enterContext(patch.object(
             instaloader.Profile, "from_username", side_effect=AssertionError("Unexpected profile lookup")
         ))
-        self.download = self.enterContext(patch("foodfinder.instagram._download_post_images", return_value=[]))
+        self.download = self.enterContext(patch("foodfinder.instagram._download_post_images", return_value=["fixture.jpg"]))
         self.enterContext(patch("foodfinder.instagram.ocr_images", return_value=""))
         self.stories = self.enterContext(patch.object(self.loader, "get_stories", return_value=[]))
 
@@ -88,6 +88,61 @@ class TimelineTests(unittest.TestCase):
         self.download.assert_called_once()
         ocr.assert_called_once()
         self.assertIn("Student Centre", source.media_text)
+
+    def test_cached_post_skips_media_but_does_not_hide_newer_post_after_it(self):
+        cached = {"post:fixture": {"caption": "Free pizza tomorrow!", "cache_version": 1,
+                                   "media_text": "Poster text", "ocr_complete": 1}}
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media(), media("new")])):
+            sources = self.sources(saved_sources=cached, include_stories=False)
+        self.assertEqual([source.source_key for source in sources], ["post:new"])
+        self.download.assert_called_once()
+
+    def test_edited_caption_reuses_successful_ocr(self):
+        cached = {"post:fixture": {"caption": "Free cookies tomorrow!", "cache_version": 1,
+                                   "media_text": "Student Centre, 6 PM", "ocr_complete": 1}}
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])), patch(
+            "foodfinder.instagram.ocr_images"
+        ) as ocr:
+            source = self.sources(saved_sources=cached, include_stories=False)[0]
+        self.assertEqual(source.caption, "Free pizza tomorrow!")
+        self.assertEqual(source.media_text, "Student Centre, 6 PM")
+        self.assertTrue(source.ocr_complete)
+        self.download.assert_not_called()
+        ocr.assert_not_called()
+
+    def test_failed_or_legacy_sources_are_retried(self):
+        for version in (0, None):
+            self.download.reset_mock()
+            cached = {"post:fixture": {"caption": "Free pizza tomorrow!", "cache_version": version}}
+            with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])):
+                sources = self.sources(saved_sources=cached, include_stories=False)
+            self.assertEqual(len(sources), 1)
+            self.download.assert_called_once()
+
+    def test_empty_media_download_is_not_marked_successful_for_caching(self):
+        self.download.return_value = []
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])):
+            source = self.sources(include_stories=False)[0]
+        self.assertTrue(source.collection_warning)
+        self.assertFalse(source.ocr_complete)
+
+    def test_caption_edit_that_newly_needs_ocr_downloads_images(self):
+        cached = {"post:fixture": {"caption": "Meet the team!", "cache_version": 1,
+                                   "media_text": "", "ocr_complete": 0}}
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])):
+            self.sources(saved_sources=cached, include_stories=False)
+        self.download.assert_called_once()
+
+    def test_successfully_cached_story_skips_download(self):
+        item = SimpleNamespace(mediaid=123, caption="")
+        self.stories.return_value = [SimpleNamespace(get_items=lambda: iter([item]))]
+        cached = {"story:123": {"caption": "", "cache_version": 1}}
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])), patch.object(
+            self.loader, "download_storyitem"
+        ) as download_story:
+            sources = self.sources(saved_sources=cached)
+        self.assertEqual([source.kind for source in sources], ["post"])
+        download_story.assert_not_called()
 
     def test_one_post_uses_authenticated_timeline_without_profile_or_stories(self):
         with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])) as query:

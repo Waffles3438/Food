@@ -290,6 +290,16 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(len(events[0]["supporting_sources"]), 2)
 
+    def test_empty_sources_are_cached_and_failed_reads_remain_retryable(self):
+        for warning, expected_version in (("", 1), ("OCR incomplete", 0)):
+            source = MediaSource("post:empty", "post", "https://www.instagram.com/p/empty/",
+                                 "", "", POSTED.isoformat(), collection_warning=warning)
+            process_source(self.db_path, self.account_id, "bakingclub", source)
+            with connect(self.db_path) as db:
+                row = db.execute("SELECT cache_version,ocr_complete FROM sources WHERE source_key='post:empty'").fetchone()
+            self.assertEqual(row["cache_version"], expected_version)
+            self.assertEqual(row["ocr_complete"], 0)
+
     def test_changing_a_post_moves_old_offer_to_review(self):
         source = MediaSource(
             "post:abc123", "post", "https://www.instagram.com/p/abc123/",
@@ -305,6 +315,16 @@ class PersistenceTests(unittest.TestCase):
         review = list_events(view="review", db_path=self.db_path)
         self.assertEqual(len(review), 1)
         self.assertIn("post changed", review[0]["review_reason"])
+
+    def test_corrected_date_replaces_old_automatic_card(self):
+        for caption in ("Pizza social September 21, 2022. Free pizza!",
+                        "Pizza social September 17, 2026. Free pizza!"):
+            source = MediaSource("post:datefix", "post", "https://www.instagram.com/p/datefix/",
+                                 caption, "", POSTED.isoformat())
+            process_source(self.db_path, self.account_id, "bakingclub", source)
+        with connect(self.db_path) as db:
+            rows = db.execute("SELECT event_date FROM events WHERE status NOT IN ('duplicate','dismissed')").fetchall()
+        self.assertEqual([row[0] for row in rows], ["2026-09-17"])
 
     def test_clear_cancellation_updates_the_existing_event(self):
         announced = MediaSource(

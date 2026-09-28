@@ -92,6 +92,7 @@ class MediaSource:
     evidence_path: str = ""
     truncated: bool = False
     collection_warning: str = ""
+    ocr_complete: bool = False
 
 
 def _session_path(username: str) -> Path:
@@ -347,6 +348,7 @@ def iter_account_sources(
     now: datetime | None = None,
     loader: object | None = None,
     include_stories: bool = True,
+    saved_sources: dict[str, dict] | None = None,
 ) -> Iterator[MediaSource]:
     """Yield bounded recent posts and accessible Stories for one public club account."""
     try:
@@ -365,6 +367,7 @@ def iter_account_sources(
     report(f"@{username}: requesting Instagram timeline.")
     posts = _timeline_posts(loader, username)
     account_id = None
+    saved_sources = saved_sources or {}
 
     with tempfile.TemporaryDirectory(prefix="uoft-food-posts-") as scratch_name:
         scratch = Path(scratch_name)
@@ -383,21 +386,34 @@ def iter_account_sources(
             images: list[str] = []
             warning = ""
             caption = (post.caption or "").strip()
+            cached = saved_sources.get(f"post:{post.shortcode}", {})
+            if cached.get("cache_version") == 1 and cached.get("caption") == caption:
+                report(f"@{username}: post {post.shortcode} unchanged; skipping saved post.")
+                continue
             media_text = ""
+            ocr_complete = False
             if caption_needs_ocr(caption, posted_at=post_date):
-                report(f"@{username}: post {post.shortcode} needs image text; downloading artwork.")
-                try:
-                    images = _download_post_images(loader, post, scratch)
-                except Exception as exc:
-                    if collection_failure_kind(exc):
-                        raise
-                    images = []
-                    warning = "Post images could not be read; only the caption was checked."
-                try:
-                    media_text = ocr_images(images)
-                except OCRUnavailableError as exc:
-                    media_text = exc.partial_text
-                    warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
+                if cached.get("cache_version") == 1 and cached.get("ocr_complete"):
+                    media_text = cached["media_text"]
+                    ocr_complete = True
+                    report(f"@{username}: caption edited for {post.shortcode}; reusing saved image text.")
+                else:
+                    report(f"@{username}: post {post.shortcode} needs image text; downloading artwork.")
+                    try:
+                        images = _download_post_images(loader, post, scratch)
+                        if not images:
+                            warning = "Post images could not be read; only the caption was checked."
+                    except Exception as exc:
+                        if collection_failure_kind(exc):
+                            raise
+                        images = []
+                        warning = "Post images could not be read; only the caption was checked."
+                    try:
+                        media_text = ocr_images(images)
+                        ocr_complete = not warning
+                    except OCRUnavailableError as exc:
+                        media_text = exc.partial_text
+                        warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
             else:
                 report(f"@{username}: post {post.shortcode} checked from caption; image OCR skipped.")
             yield MediaSource(
@@ -408,6 +424,7 @@ def iter_account_sources(
                 media_text=media_text,
                 posted_at=post_date.astimezone(timezone.utc).isoformat(timespec="seconds"),
                 collection_warning=warning,
+                ocr_complete=ocr_complete,
             )
 
         if posts_seen == limit:
@@ -426,6 +443,11 @@ def iter_account_sources(
         report(f"@{username}: checking accessible Stories.")
         for story in loader.get_stories(userids=[account_id]):
             for item in story.get_items():
+                stable_item_id = str(getattr(item, "mediaid", None) or getattr(item, "id", None) or "")
+                cached = saved_sources.get(f"story:{stable_item_id}", {}) if stable_item_id else {}
+                if cached.get("cache_version") == 1 and cached.get("caption") == (getattr(item, "caption", None) or "").strip():
+                    report(f"@{username}: Story {stable_item_id} already processed; skipping saved Story.")
+                    continue
                 report(f"@{username}: downloading Story media.")
                 with tempfile.TemporaryDirectory(prefix="uoft-food-story-") as story_tmp:
                     story_path = Path(story_tmp)
@@ -446,7 +468,7 @@ def iter_account_sources(
                     for video in videos:
                         report(f"@{username}: extracting sample frames from Story video.")
                         images.extend(_story_video_frames(str(video), story_path))
-                    story_warning = ""
+                    story_warning = "" if images else "Story media could not be read; retry collection."
                     try:
                         media_text = ocr_images(images)
                     except OCRUnavailableError as exc:
@@ -473,6 +495,7 @@ def iter_account_sources(
                         expires_at=expires.astimezone(timezone.utc).isoformat(timespec="seconds") if expires else "",
                         evidence_path=first_evidence,
                         collection_warning=story_warning,
+                        ocr_complete=not story_warning,
                     )
 
 

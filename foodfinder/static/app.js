@@ -35,6 +35,28 @@
     state.toastTimer = setTimeout(() => toast.classList.remove("visible"), 2800);
   }
 
+  async function loadCounts() {
+    const counts = await api("/api/event-counts");
+    $("#stat-review").textContent = counts.review;
+    $("#tab-review").textContent = counts.review;
+    $("#tab-today").textContent = counts.today;
+    $("#stat-upcoming").textContent = counts.upcoming;
+    $("#tab-upcoming").textContent = counts.upcoming;
+  }
+
+  function updateCard(card, event) {
+    if (!card.isConnected) return;
+    if (event.status === "dismissed" || (state.view === "review" && !event.review_reason && event.food_confidence !== "low")) {
+      card.remove();
+    } else {
+      card.replaceWith(renderEvent(event));
+    }
+    const count = $$(".event-card", $("#events")).length;
+    $("#event-count").textContent = `${count} ${count === 1 ? "event" : "events"}`;
+    if (!count) $("#events").append(node("div", "empty-state", "No events match this view."));
+    loadCounts().catch(() => {});
+  }
+
   async function loadAll() {
     await Promise.allSettled([loadEvents(), loadClubs(), loadStatus()]);
   }
@@ -57,6 +79,16 @@
     list.replaceChildren(Object.assign(node("div", "loading-card"), { textContent: "Loading events…" }));
     try {
       const events = await api(eventURL());
+      if (state.view === "review") {
+        const direction = $("#review-sort").value === "oldest" ? 1 : -1;
+        events.sort((a, b) => {
+          // Unknown dates stay last in either direction.
+          if (!a.event_date || !b.event_date) return Number(!a.event_date) - Number(!b.event_date);
+          const left = `${a.event_date}T${a.event_time || "00:00"}`;
+          const right = `${b.event_date}T${b.event_time || "00:00"}`;
+          return direction * left.localeCompare(right) || a.id.localeCompare(b.id);
+        });
+      }
       list.replaceChildren();
       $("#event-count").textContent = `${events.length} ${events.length === 1 ? "event" : "events"}`;
       if (state.view === "upcoming") $("#stat-upcoming").textContent = events.length;
@@ -145,13 +177,35 @@
     edit.addEventListener("click", () => toggleEditor(card, event));
     actions.append(edit);
     if (state.view === "review") {
+      const approve = node("button", "button button-green", "Approve");
+      approve.type = "button";
+      approve.title = "Confirm the food offer and approve these event details";
+      approve.setAttribute("aria-label", `Approve ${event.title}`);
+      approve.addEventListener("click", async () => {
+        if (approve.disabled) return;
+        approve.disabled = true; approve.textContent = "Approving…";
+        try {
+          const updated = await api(`/api/events/${event.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: "upcoming", review_reason: "", food_confidence: "high" }),
+          });
+          updateCard(card, updated); showToast("Event approved.");
+        } catch (error) { showToast(error.message); }
+        finally { approve.disabled = false; approve.textContent = "Approve"; }
+      });
+      actions.append(approve);
       const hide = node("button", "icon-button", "×");
       hide.type = "button";
       hide.title = "Dismiss from this list";
       hide.setAttribute("aria-label", "Dismiss event");
       hide.addEventListener("click", async () => {
-        try { await api(`/api/events/${event.id}`, { method: "PATCH", body: JSON.stringify({ status: "dismissed" }) }); showToast("Event dismissed."); loadAll(); }
-        catch (error) { showToast(error.message); }
+        if (hide.disabled) return;
+        hide.disabled = true; hide.textContent = "…"; hide.setAttribute("aria-label", "Dismissing event");
+        try {
+          const updated = await api(`/api/events/${event.id}`, { method: "PATCH", body: JSON.stringify({ status: "dismissed" }) });
+          updateCard(card, updated); showToast("Event dismissed.");
+        } catch (error) { showToast(error.message); }
+        finally { hide.disabled = false; hide.textContent = "×"; hide.setAttribute("aria-label", "Dismiss event"); }
       });
       actions.append(hide);
     }
@@ -212,8 +266,13 @@
       e.preventDefault();
       const patch = Object.fromEntries(new FormData(form).entries());
       patch.status = "upcoming"; patch.review_reason = "";
-      try { await api(`/api/events/${event.id}`, { method: "PATCH", body: JSON.stringify(patch) }); showToast("Correction saved."); loadAll(); }
-      catch (error) { showToast(error.message); }
+      if (save.disabled) return;
+      save.disabled = true; cancel.disabled = true; save.textContent = "Saving…";
+      try {
+        const updated = await api(`/api/events/${event.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+        updateCard(card, updated); showToast("Correction saved.");
+      } catch (error) { showToast(error.message); }
+      finally { save.disabled = false; cancel.disabled = false; save.textContent = "Save correction"; }
     });
     card.append(form);
   }
@@ -273,18 +332,13 @@
       const total = Object.values(progress.accounts || {}).reduce((sum, value) => sum + value, 0);
       const checked = (progress.accounts?.ok || 0) + (progress.accounts?.partial || 0);
       $("#stat-checked").textContent = total ? `${checked} / ${total}` : "0";
-      const review = await api("/api/events?view=review");
-      $("#stat-review").textContent = review.length;
-      $("#tab-review").textContent = review.length;
-      const today = await api("/api/events?view=today");
-      $("#tab-today").textContent = today.length;
-      $("#tab-upcoming").textContent = $("#stat-upcoming").textContent || "0";
+      await loadCounts();
       const missing = progress.missing_handles || 0;
       let message = run?.message || "No scan has run yet. Start one to discover clubs and check Instagram.";
       if (progress.running && run) message = `${run.message || "Scanning"} · ${run.accounts_checked || 0} of ${run.accounts_total || 0} accounts checked · ${run.posts_seen || 0} posts read.`;
       if (!progress.running && run?.status) message += ` ${run.accounts_checked || 0} accounts checked, ${run.posts_seen || 0} posts read, ${run.events_found || 0} events identified.`;
       if (!progress.running && progress.retry?.next_scan_at) message += ` ${progress.retry.reason}: ${new Date(progress.retry.next_scan_at).toLocaleString()}. Keep the app open.`;
-      if (!progress.running && progress.retry?.requires_login) message += ` ${progress.retry.reason}`;
+      if (!progress.running && progress.retry?.requires_login && !progress.retry?.next_scan_at) message += ` ${progress.retry.reason}`;
       if (missing) message += ` ${missing} club listings still need an Instagram handle.`;
       if (progress.accounts?.error) message += ` ${progress.accounts.error} accounts need attention.`;
       $("#scan-message").textContent = message;
@@ -304,6 +358,7 @@
   function init() {
     $$(".tab").forEach((tab) => tab.addEventListener("click", () => {
       state.view = tab.dataset.view;
+      $("#review-sort-field").hidden = state.view !== "review";
       $$(".tab").forEach((item) => item.classList.toggle("active", item === tab));
       loadEvents();
     }));

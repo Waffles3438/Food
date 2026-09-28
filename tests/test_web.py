@@ -73,6 +73,37 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(corrected.status_code, 200)
         self.assertEqual(corrected.json()["location"], "Sidney Smith Hall")
 
+    def test_counts_match_lists_and_change_after_dismissal(self):
+        counts = self.client.get("/api/event-counts").json()
+        for view in ("upcoming", "review", "today"):
+            self.assertEqual(counts[view], len(self.client.get(f"/api/events?view={view}").json()))
+        event = self.client.get("/api/events").json()[0]
+        self.client.patch(f"/api/events/{event['id']}", json={"status": "dismissed"})
+        self.assertEqual(self.client.get("/api/event-counts").json()["upcoming"], 0)
+
+    def test_approval_clears_low_confidence_and_survives_reprocessing(self):
+        source = MediaSource("post:approve", "post", "https://www.instagram.com/p/approve/",
+                             "Cookie meetup! Refreshments available. September 28 2026.", "",
+                             datetime(2026, 9, 23, 12).isoformat())
+        process_source(self.db_path, self.account_id, "testfoodclub", source)
+        event = self.client.get("/api/events?view=review").json()[0]
+        approved = self.client.patch(f"/api/events/{event['id']}", json={
+            "status": "upcoming", "review_reason": "", "food_confidence": "high",
+        })
+        self.assertEqual(approved.status_code, 200)
+        self.assertEqual(approved.json()["event_date"], event["event_date"])
+        process_source(self.db_path, self.account_id, "testfoodclub", source)
+        self.assertNotIn(event["id"], [row["id"] for row in self.client.get("/api/events?view=review").json()])
+        self.assertIn(event["id"], [row["id"] for row in self.client.get("/api/events").json()])
+
+    def test_list_uses_one_connection_and_keeps_evidence(self):
+        from foodfinder.scanner import list_events
+        with patch("foodfinder.scanner.connect", wraps=connect) as connections:
+            events = list_events(db_path=self.db_path)
+        self.assertEqual(connections.call_count, 1)
+        self.assertTrue(events[0]["supporting_sources"])
+        self.assertNotIn("media_blob", events[0])
+
     def test_scan_action_queues_a_single_background_scan(self):
         with patch("foodfinder.web.launch_scan") as launch:
             response = self.client.post("/api/scan", json={"discover": True})
