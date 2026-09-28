@@ -88,22 +88,30 @@ class EventCandidate:
     evidence_excerpt: str = ""
 
 
+class OCRUnavailableError(RuntimeError):
+    def __init__(self, message: str, partial_text: str = ""):
+        super().__init__(message)
+        self.partial_text = partial_text
+
+
 def ocr_images(paths: Iterable[str]) -> str:
     """Read event artwork using EasyOCR (English only, CPU only)."""
     paths = list(paths)
     if not paths:
         return ""
     try:
-        import easyocr
-    except ImportError:
-        return ""
-    reader = _ocr_reader()
+        reader = _ocr_reader()
+    except Exception as exc:
+        raise OCRUnavailableError("Poster OCR could not initialize. Check the local OCR model installation.") from exc
     out: list[str] = []
+    failed = False
     for path in paths:
         try:
             out.extend(str(line) for line in reader.readtext(path, detail=0) if str(line).strip())
         except Exception:
-            continue
+            failed = True
+    if failed:
+        raise OCRUnavailableError("Some poster images could not be read.", "\n".join(out))
     return "\n".join(out)
 
 
@@ -115,7 +123,7 @@ def _ocr_reader() -> Any:
     if _READER is None:
         import easyocr
 
-        _READER = easyocr.Reader(["en"], gpu=False)
+        _READER = easyocr.Reader(["en"], gpu=False, verbose=False)
     return _READER
 
 

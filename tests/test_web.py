@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - enabled after setup.ps1 installs runti
 from foodfinder.database import connect, initialize, link_club_account, upsert_club, utcnow
 from foodfinder.instagram import MediaSource
 from foodfinder.scanner import process_source
+from foodfinder.settings import SCAN_INTERVAL_HOURS
 from foodfinder.web import _recover_orphaned_run, _scheduler
 
 
@@ -105,6 +106,18 @@ class DashboardApiTests(unittest.TestCase):
         self.assertIn("until the next scheduled scan window", response.json()["message"])
         launch.assert_not_called()
 
+    def test_please_wait_restriction_blocks_manual_rescan(self):
+        now = utcnow()
+        with connect(self.db_path) as db:
+            db.execute(
+                "INSERT INTO scan_runs(id,kind,status,started_at,finished_at,message) VALUES ('temporary','instagram','partial',?,?,?)",
+                (now, now, "Scan paused because Instagram temporarily restricted access."),
+            )
+        with patch("foodfinder.web.launch_scan") as launch:
+            response = self.client.post("/api/scan", json={})
+        self.assertFalse(response.json()["started"])
+        launch.assert_not_called()
+
     def test_app_rejects_non_loopback_hosts(self):
         other = TestClient(self.client.app, base_url="http://attacker.example")
         response = other.get("/api/clubs")
@@ -129,6 +142,35 @@ class SchedulerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await _scheduler(app)
             launch.assert_not_called()
+
+    async def test_stale_interrupted_scan_is_due_after_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "recovery.sqlite3"
+            initialize(db_path)
+            started_at = (
+                datetime.now(timezone.utc) - timedelta(hours=SCAN_INTERVAL_HOURS + 1)
+            ).isoformat(timespec="seconds")
+            with connect(db_path) as db:
+                db.execute(
+                    "INSERT INTO scan_runs(id,kind,status,started_at,message) VALUES ('interrupted','full','running',?,'Scanning')",
+                    (started_at,),
+                )
+
+            _recover_orphaned_run(db_path)
+            with connect(db_path) as db:
+                recovered = db.execute(
+                    "SELECT status,started_at,finished_at FROM scan_runs WHERE id='interrupted'"
+                ).fetchone()
+            self.assertEqual(recovered["status"], "partial")
+            self.assertEqual(recovered["finished_at"], started_at)
+
+            app = SimpleNamespace(state=SimpleNamespace(db_path=str(db_path)))
+            with patch("foodfinder.web.launch_scan") as launch, patch(
+                "foodfinder.web.asyncio.sleep", side_effect=asyncio.CancelledError
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await _scheduler(app)
+            launch.assert_called_once_with(str(db_path))
 
 
 if __name__ == "__main__":

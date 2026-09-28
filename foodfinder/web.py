@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 
-from foodfinder.database import connect, initialize, utcnow
+from foodfinder.database import connect, initialize
 from foodfinder.scanner import (
     get_event,
     launch_scan,
@@ -46,10 +46,9 @@ def _days_since(iso_timestamp: str) -> int | None:
 def _recover_orphaned_run(db_path: Path | str) -> None:
     with connect(db_path) as db:
         db.execute(
-            """UPDATE scan_runs SET status='partial', finished_at=?,
+            """UPDATE scan_runs SET status='partial', finished_at=started_at,
                message='Previous app session ended during this scan; remaining accounts are deferred to the next scheduled scan.'
                WHERE status='running'""",
-            (utcnow(),),
         )
 
 
@@ -61,7 +60,7 @@ def _scan_cooldown_active(db_path: Path | str, now: datetime | None = None) -> b
     if not latest or not latest["finished_at"]:
         return False
     message = latest["message"]
-    rate_limited = "returned HTTP 429" in message
+    rate_limited = "returned HTTP 429" in message or "Instagram temporarily restricted access" in message
     interrupted = message.startswith("Previous app session ended during this scan; remaining accounts are deferred")
     if not (rate_limited or interrupted):
         return False

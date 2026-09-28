@@ -17,8 +17,8 @@ from zoneinfo import ZoneInfo
 from foodfinder.database import connect, initialize, link_club_account, upsert_club, utcnow
 from foodfinder.discovery import Club, fetch_myutsu_clubs, fetch_sop_clubs, merge_directory_clubs
 from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events
-from foodfinder.instagram import MediaSource, _make_loader, iter_account_sources
-from foodfinder.settings import DISCOVERY_INTERVAL_DAYS
+from foodfinder.instagram import MediaSource, _make_loader, collection_failure_kind, iter_account_sources
+from foodfinder.settings import DISCOVERY_INTERVAL_DAYS, POST_LIMIT, POST_AGE_DAYS
 
 TORONTO = ZoneInfo("America/Toronto")
 NAMESPACE = uuid.UUID("8fc28cea-5d40-4b2b-9509-8af079db70ed")
@@ -275,24 +275,7 @@ def scan_active() -> bool:
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
-    """Recognize Instaloader's final 429 after it wraps retry errors as ConnectionException."""
-    pending: list[BaseException] = [exc]
-    seen: set[int] = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        if type(current).__name__ in {"TooManyRequestsException", "QueryReturnedTooManyRequestsException"}:
-            return True
-        message = str(current).casefold()
-        if "429" in message and ("too many requests" in message or "rate limit" in message):
-            return True
-        if current.__cause__ is not None:
-            pending.append(current.__cause__)
-        if current.__context__ is not None:
-            pending.append(current.__context__)
-    return False
+    return collection_failure_kind(exc) == "rate_limit"
 
 
 def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False) -> str:
@@ -350,15 +333,23 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                         raise
                 checked = 0
                 truncated = False
+                warnings: set[str] = set()
                 for source in iter_account_sources(username, loader=loader):
+                    if source.collection_warning:
+                        warnings.add(source.collection_warning)
                     if source.truncated:
                         truncated = True
+                        continue
+                    if not source.source_key:
                         continue
                     checked += 1
                     posts_seen += int(source.kind == "post")
                     events_found += process_source(db_path, account_id, username, source)
-                account_status = "partial" if truncated else "ok"
-                message = "Initial scan is limited to 100 posts in the last 60 days." if truncated else "Scanned posts and accessible Stories."
+                if truncated:
+                    warnings.add(f"Reached the {POST_LIMIT}-post inspection limit; more posts may exist. Posts older than {POST_AGE_DAYS} days were skipped.")
+                account_status = "partial" if warnings else "ok"
+                message = " ".join(sorted(warnings)) if warnings else "Scanned posts and accessible Stories."
+                failures += int(bool(warnings))
             except Exception as exc:
                 failures += 1
                 if loader_error is exc:
@@ -367,9 +358,15 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 elif _is_rate_limit_error(exc):
                     message = "Instagram returned HTTP 429 for this account; the queue was paused."
                     pause_message = "Scan paused after Instagram returned HTTP 429. Wait before starting another scan; remaining accounts were left queued."
-                elif type(exc).__name__ in {"LoginRequiredException", "LoginException", "TwoFactorAuthRequiredException", "BadCredentialsException"}:
+                elif collection_failure_kind(exc) == "temporary_limit":
+                    message = "Instagram temporarily restricted access with a please-wait or feedback response; the queue was paused."
+                    pause_message = "Scan paused because Instagram temporarily restricted access. This does not establish that the saved login is expired."
+                elif collection_failure_kind(exc) == "authentication":
                     message = "Instagram login needs attention; run login-instagram.ps1 again."
                     pause_message = "Scan paused because Instagram requires login verification. Resolve the challenge, then run login-instagram.ps1."
+                elif collection_failure_kind(exc) in {"access", "response", "connection"}:
+                    message = "Instagram access failed; the account queue was paused. Check your browser session and try a single account later."
+                    pause_message = "Scan paused because Instagram did not return readable account data. A login restriction, network failure, or API change may be responsible."
                 else:
                     message = f"Could not read this account ({type(exc).__name__})."
                 account_status = "error"

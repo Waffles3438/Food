@@ -8,8 +8,8 @@
 
 ## Testing and Instagram access
 
-- Use local fixtures and mocks for routine development and tests; do not send live Instagram requests as a test.
-- If the user explicitly requests a live Instagram check, use one scanner instance, respect any active cooldown, and stop after a 429 instead of retrying or moving through more accounts.
+- Use local fixtures and mocks for routine development and tests. Live Instagram checks are allowed when explicitly requested by the user.
+- For an explicitly requested live Instagram check, use one scanner instance and stop after a 429 instead of retrying or moving through more accounts.
 - Run the project test suite after relevant code changes:
 
   ```powershell

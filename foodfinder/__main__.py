@@ -15,6 +15,7 @@ def main() -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("serve", help="start the local dashboard")
     login = subcommands.add_parser("login", help="log in to your own Instagram account")
+    login.add_argument("--username", default="", help="required account identity when importing browser cookies")
     login.add_argument(
         "--browser-cookie",
         choices=("brave", "chrome", "chromium", "edge", "firefox", "librewolf", "opera", "opera_gx", "vivaldi"),
@@ -36,7 +37,7 @@ def main() -> int:
         from foodfinder.instagram import interactive_login
 
         try:
-            username = interactive_login(browser_cookie=args.browser_cookie or "")
+            username = interactive_login(browser_cookie=args.browser_cookie or "", username=args.username)
         except Exception as exc:
             print(f"Instagram login was not completed: {exc}", file=sys.stderr)
             return 1

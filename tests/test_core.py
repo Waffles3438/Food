@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from foodfinder.database import connect, initialize, link_club_account, upsert_club
@@ -45,24 +45,35 @@ class InstagramLoginTests(unittest.TestCase):
         cookies = [
             SimpleNamespace(domain=".instagram.com", name="sessionid", value="local-test-cookie"),
             SimpleNamespace(domain="facebook.com", name="c_user", value="not-imported"),
+            SimpleNamespace(domain="notinstagram.com", name="sessionid", value="not-imported"),
+            SimpleNamespace(domain="instagram.com.example.com", name="sessionid", value="not-imported"),
+            SimpleNamespace(domain=".instagram.com", name="csrftoken", value="fixture-csrf"),
+            SimpleNamespace(domain=".instagram.com", name="ds_user_id", value="fixture-id"),
         ]
-        browser_cookie3 = SimpleNamespace(edge=lambda: cookies)
+        for cookie in cookies:
+            cookie.is_expired = lambda: False
+        cookies.append(SimpleNamespace(domain=".instagram.com", name="sessionid", value="expired", is_expired=lambda: True))
+        browser_cookie3 = SimpleNamespace(edge=Mock(return_value=cookies))
 
         class Context:
             def update_cookies(self, value):
                 self.cookies = value
 
         context = Context()
-        loader = SimpleNamespace(context=context, test_login=lambda: "uoftfoodscraper")
+        context._session = SimpleNamespace(headers={})
+        context.graphql_query = Mock(return_value={"data": {"user": {"username": "uoftfoodscraper"}}})
+        loader = SimpleNamespace(context=context)
         with patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}):
             username = _import_browser_session(loader, "edge")
         self.assertEqual(username, "uoftfoodscraper")
-        self.assertEqual(context.cookies, {"sessionid": "local-test-cookie"})
+        self.assertEqual(context.cookies, {"sessionid": "local-test-cookie", "csrftoken": "fixture-csrf", "ds_user_id": "fixture-id"})
+        self.assertEqual(context._session.headers["X-CSRFToken"], "fixture-csrf")
+        browser_cookie3.edge.assert_called_once_with(domain_name="instagram.com")
         self.assertEqual(context.username, "uoftfoodscraper")
 
     def test_chrome_cookie_decryption_error_suggests_firefox(self):
         browser_cookie3 = SimpleNamespace(
-            chrome=lambda: (_ for _ in ()).throw(RuntimeError("Unable to get key for cookie decryption"))
+            chrome=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Unable to get key for cookie decryption"))
         )
         loader = SimpleNamespace(context=SimpleNamespace())
         with patch.dict(sys.modules, {"browser_cookie3": browser_cookie3}):
@@ -393,6 +404,48 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(run["accounts_total"], 2)
         self.assertEqual(run["accounts_checked"], 1)
         self.assertIn("returned HTTP 429", run["message"])
+
+    def test_abort_challenge_and_invalid_api_response_pause_before_next_account(self):
+        from foodfinder.instagram import InstagramResponseError
+        from instaloader.exceptions import AbortDownloadException
+
+        with connect(self.db_path) as db:
+            second_club = upsert_club(db, source_key="manual:second", name="Second Campus Club")
+            link_club_account(db, second_club, "secondclub")
+            db.execute("INSERT INTO kv(key,value) VALUES ('last_discovery',?)",
+                       (datetime.now().astimezone().isoformat(),))
+        for error in (AbortDownloadException("challenge_required"),
+                      AbortDownloadException("401 Unauthorized: Please wait a few minutes before you try again."),
+                      AbortDownloadException('responded with "403 Forbidden"'),
+                      InstagramResponseError("Unavailable timeline")):
+            with self.subTest(error=error), patch("foodfinder.scanner._make_loader", return_value=(object(), "loggedin")), patch(
+                "foodfinder.scanner.iter_account_sources", side_effect=error
+            ) as collect:
+                run_id = run_scan(self.db_path)
+            self.assertEqual(collect.call_count, 1)
+            with connect(self.db_path) as db:
+                run = db.execute("SELECT status,accounts_checked,message FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+            self.assertEqual(run["status"], "partial")
+            self.assertEqual(run["accounts_checked"], 1)
+            self.assertIn("paused", run["message"])
+
+    def test_empty_timeline_coverage_warning_is_visible_and_not_counted_as_post(self):
+        with connect(self.db_path) as db:
+            db.execute("INSERT INTO kv(key,value) VALUES ('last_discovery',?)",
+                       (datetime.now().astimezone().isoformat(),))
+        warning = MediaSource("", "coverage", "", "", "", "", collection_warning="Stories could not be checked.")
+        with patch("foodfinder.scanner._make_loader", return_value=(object(), "loggedin")), patch(
+            "foodfinder.scanner.iter_account_sources", return_value=iter([warning])
+        ):
+            run_id = run_scan(self.db_path)
+        with connect(self.db_path) as db:
+            run = db.execute("SELECT status,posts_seen FROM scan_runs WHERE id=?", (run_id,)).fetchone()
+            account = db.execute("SELECT status,status_message FROM accounts WHERE id=?", (self.account_id,)).fetchone()
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 0)
+        self.assertEqual(run["status"], "partial")
+        self.assertEqual(run["posts_seen"], 0)
+        self.assertEqual(account["status"], "partial")
+        self.assertIn("Stories could not be checked", account["status_message"])
 
 
 if __name__ == "__main__":
