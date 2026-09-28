@@ -17,8 +17,10 @@ from zoneinfo import ZoneInfo
 from foodfinder.database import connect, initialize, link_club_account, upsert_club, utcnow
 from foodfinder.discovery import Club, fetch_myutsu_clubs, fetch_sop_clubs, merge_directory_clubs
 from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events
-from foodfinder.instagram import MediaSource, _make_loader, collection_failure_kind, iter_account_sources
+from foodfinder.instagram import MediaSource, _make_loader, collection_error_detail, collection_failure_kind, iter_account_sources
+from foodfinder.retry import retry_plan
 from foodfinder.settings import DISCOVERY_INTERVAL_DAYS, POST_LIMIT, POST_AGE_DAYS
+from foodfinder.progress import ScanProgress, report
 
 TORONTO = ZoneInfo("America/Toronto")
 NAMESPACE = uuid.UUID("8fc28cea-5d40-4b2b-9509-8af079db70ed")
@@ -291,7 +293,13 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
     posts_seen = 0
     accounts_checked = 0
     pause_message = ""
+    pause_kind = ""
+    error_detail = ""
+    loader = None
+    progress = ScanProgress()
+    progress.start()
     try:
+        report(f"Scan {run_id[:8]} started.")
         with connect(db_path) as db:
             should_discover = force_discovery or due_for_discovery(db)
             db.execute(
@@ -299,10 +307,13 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 (run_id, "full" if should_discover else "instagram", utcnow(), "Discovering clubs" if should_discover else "Loading Instagram accounts"),
             )
         if should_discover:
+            report("Refreshing club directories and looking for Instagram accounts.")
             try:
-                refresh_directory(db_path)
+                stats = refresh_directory(db_path)
+                report(f"Club discovery finished: {stats['clubs']} clubs, {stats['accounts']} linked accounts.")
             except Exception as exc:
                 failures += 1
+                report(f"Club discovery failed ({type(exc).__name__}); continuing with saved clubs.")
                 with connect(db_path) as db:
                     db.execute(
                         "UPDATE scan_runs SET message=? WHERE id=?",
@@ -321,8 +332,12 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
 
         loader = None
         loader_error: Exception | None = None
-        for account in accounts:
+        report(f"Instagram queue: {len(accounts)} accounts. Checking captions first; images use OCR when needed.")
+        for index, account in enumerate(accounts, 1):
             account_id, username = str(account["id"]), str(account["username"])
+            report(f"Account {index}/{len(accounts)}: @{username} - starting.")
+            with connect(db_path) as db:
+                db.execute("UPDATE scan_runs SET message=? WHERE id=?", (f"Checking @{username}", run_id))
             try:
                 if loader is None:
                     try:
@@ -344,7 +359,11 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                         continue
                     checked += 1
                     posts_seen += int(source.kind == "post")
-                    events_found += process_source(db_path, account_id, username, source)
+                    detected = process_source(db_path, account_id, username, source)
+                    events_found += detected
+                    report(f"@{username}: saved {source.kind} {source.source_key}; {detected} upcoming detections. Run totals: {posts_seen} posts, {events_found} upcoming detections.")
+                    with connect(db_path) as db:
+                        db.execute("UPDATE scan_runs SET posts_seen=?,events_found=? WHERE id=?", (posts_seen, events_found, run_id))
                 if truncated:
                     warnings.add(f"Reached the {POST_LIMIT}-post inspection limit; more posts may exist. Posts older than {POST_AGE_DAYS} days were skipped.")
                 account_status = "partial" if warnings else "ok"
@@ -369,6 +388,12 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                     pause_message = "Scan paused because Instagram did not return readable account data. A login restriction, network failure, or API change may be responsible."
                 else:
                     message = f"Could not read this account ({type(exc).__name__})."
+                error_detail = collection_error_detail(exc)
+                category = collection_failure_kind(exc) or "unknown"
+                message += f" [{category}: {error_detail}]"
+                if pause_message:
+                    pause_kind = "authentication" if loader_error is exc else category
+                    pause_message += f" [{pause_kind}: {error_detail}]"
                 account_status = "error"
                 checked = 0
             with connect(db_path) as db:
@@ -384,8 +409,9 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 accounts_checked += 1
                 db.execute(
                     "UPDATE scan_runs SET accounts_checked=?,posts_seen=?,events_found=?,message=? WHERE id=?",
-                    (accounts_checked, posts_seen, events_found, f"Checking @{username}: {message}", run_id),
+                    (accounts_checked, posts_seen, events_found, f"Finished @{username}: {message}", run_id),
                 )
+            report(f"Account {index}/{len(accounts)}: @{username} - {account_status}. {message}")
             if pause_message:
                 break
         with connect(db_path) as db:
@@ -394,11 +420,13 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 "Some discovery or account checks failed; see account status." if failures else "Scan finished."
             )
             db.execute(
-                "UPDATE scan_runs SET status=?,finished_at=?,accounts_checked=?,posts_seen=?,events_found=?,message=? WHERE id=?",
-                (final_status, utcnow(), accounts_checked, posts_seen, events_found, final_message, run_id),
+                "UPDATE scan_runs SET status=?,finished_at=?,accounts_checked=?,posts_seen=?,events_found=?,message=?,failure_kind=?,error_detail=? WHERE id=?",
+                (final_status, utcnow(), accounts_checked, posts_seen, events_found, final_message, pause_kind, error_detail, run_id),
             )
+        report(f"Scan {final_status}: {accounts_checked}/{len(accounts)} accounts checked, {posts_seen} posts, {events_found} upcoming detections. {final_message}")
         return run_id
     except Exception as exc:
+        report(f"Scan stopped ({type(exc).__name__}). Existing results were preserved.")
         with connect(db_path) as db:
             db.execute(
                 "UPDATE scan_runs SET status='error',finished_at=?,message=? WHERE id=?",
@@ -406,6 +434,12 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
             )
         return run_id
     finally:
+        if loader is not None and callable(getattr(loader, "close", None)):
+            try:
+                loader.close()
+            except Exception:
+                pass
+        progress.close()
         _scan_lock.release()
 
 
@@ -602,6 +636,7 @@ def scan_progress(db_path: Path | str | None = None) -> dict[str, Any]:
         ).fetchone()["n"]
     return {
         "run": dict(run) if run else None,
+        "retry": retry_plan(db_path),
         "accounts": {row["status"]: row["count"] for row in statuses},
         "missing_handles": missing,
         "running": bool(run and run["status"] == "running"),

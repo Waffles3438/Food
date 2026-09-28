@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from html import unescape
 from typing import Callable, Iterable
 from urllib.parse import urljoin, urlparse
+from foodfinder.progress import report
 
 try:
     from bs4 import BeautifulSoup as _BeautifulSoup
@@ -118,6 +119,7 @@ def fetch_html(url: str) -> str:
                 retry_after = min(float(response.headers.get("Retry-After", "")), 30)
             except ValueError:
                 retry_after = 2 ** (attempt + 1)
+            report(f"Club website returned HTTP {response.status_code}; waiting {max(0, retry_after):.0f}s before retry {attempt + 2}/3.")
             time.sleep(max(0, retry_after))
             continue
         response.raise_for_status()
@@ -192,11 +194,13 @@ def _page_numbers(soup: BeautifulSoup) -> list[int]:
 
 
 def fetch_sop_clubs(fetch: Callable[[str], str] = fetch_html, *, enrich_profiles: bool = True) -> list[Club]:
+    report("Club directory: requesting first SOP page.")
     first_html = fetch(SOP_GROUPS)
     first = _soup(first_html)
     pages = _page_numbers(first)
     clubs: dict[str, Club] = {}
     for page in range(1, min(max(pages), 60) + 1):
+        report(f"Club directory: SOP page {page}/{min(max(pages), 60)}; {len(clubs)} St. George clubs found so far.")
         html = first_html if page == 1 else fetch(f"{SOP_GROUPS}?pg={page}")
         for club in parse_sop_page(html, f"{SOP_GROUPS}?pg={page}"):
             clubs.setdefault(club.source_key, club)
@@ -204,7 +208,8 @@ def fetch_sop_clubs(fetch: Callable[[str], str] = fetch_html, *, enrich_profiles
         return list(clubs.values())
 
     enriched: list[Club] = []
-    for club in clubs.values():
+    for index, club in enumerate(clubs.values(), 1):
+        report(f"Club profile {index}/{len(clubs)}: {club.name} - checking Instagram links.")
         try:
             page = _soup(fetch(club.portal_url))
             website, username = _socials(page, club.portal_url)
@@ -221,10 +226,12 @@ def fetch_sop_clubs(fetch: Callable[[str], str] = fetch_html, *, enrich_profiles
                     "",
                 )
             if website and not username:
+                report(f"Club profile {index}/{len(clubs)}: {club.name} - checking linked website.")
                 site = _soup(fetch(website))
                 _, username = _socials(site, website)
             enriched.append(Club(**{**asdict(club), "website": website, "instagram_username": username}))
-        except Exception:
+        except Exception as exc:
+            report(f"Club profile {index}/{len(clubs)}: could not finish ({type(exc).__name__}); keeping directory listing.")
             # Keep directory records even when an individual club site is offline.
             enriched.append(club)
         time.sleep(0.12)
@@ -239,6 +246,7 @@ def _normal_name(name: str) -> str:
 
 def fetch_myutsu_clubs(fetch: Callable[[str], str] = fetch_html) -> list[Club]:
     """Collect UTSU gallery names; group profile links can be manually resolved in the UI."""
+    report("Club directory: requesting MyUTSU listings.")
     html = fetch(MYUTSU_GROUPS)
     soup = _soup(html)
     clubs: dict[str, Club] = {}

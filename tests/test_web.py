@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from fixed_clock import EventFixtureDateTime
 
 try:
     from fastapi.testclient import TestClient
@@ -23,6 +24,8 @@ from foodfinder.web import _recover_orphaned_run, _scheduler
 @unittest.skipIf(TestClient is None, "Install the pinned FastAPI dependencies to run the web tests.")
 class DashboardApiTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch("foodfinder.events.datetime", EventFixtureDateTime))
+        self.enterContext(patch("foodfinder.scanner.datetime", EventFixtureDateTime))
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "web.sqlite3"
         initialize(self.db_path)

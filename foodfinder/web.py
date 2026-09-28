@@ -16,6 +16,8 @@ from fastapi.templating import Jinja2Templates
 from fastapi import Request
 
 from foodfinder.database import connect, initialize
+from foodfinder.progress import configure_progress_logging, report
+from foodfinder.retry import retry_plan
 from foodfinder.scanner import (
     get_event,
     launch_scan,
@@ -46,57 +48,40 @@ def _days_since(iso_timestamp: str) -> int | None:
 def _recover_orphaned_run(db_path: Path | str) -> None:
     with connect(db_path) as db:
         db.execute(
-            """UPDATE scan_runs SET status='partial', finished_at=started_at,
+            """UPDATE scan_runs SET status='partial', finished_at=started_at, failure_kind='interrupted',
                message='Previous app session ended during this scan; remaining accounts are deferred to the next scheduled scan.'
                WHERE status='running'""",
         )
 
 
 def _scan_cooldown_active(db_path: Path | str, now: datetime | None = None) -> bool:
-    with connect(db_path) as db:
-        latest = db.execute(
-            "SELECT finished_at,message FROM scan_runs ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
-    if not latest or not latest["finished_at"]:
-        return False
-    message = latest["message"]
-    rate_limited = "returned HTTP 429" in message or "Instagram temporarily restricted access" in message
-    interrupted = message.startswith("Previous app session ended during this scan; remaining accounts are deferred")
-    if not (rate_limited or interrupted):
-        return False
-    try:
-        finished = datetime.fromisoformat(latest["finished_at"])
-    except ValueError:
-        return False
-    if finished.tzinfo is None:
-        finished = finished.replace(tzinfo=timezone.utc)
-    current = now or datetime.now(timezone.utc)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=timezone.utc)
-    return current - finished.astimezone(timezone.utc) < timedelta(hours=SCAN_INTERVAL_HOURS)
+    return retry_plan(db_path, now=now)["cooldown"]
 
 
 async def _scheduler(app: FastAPI) -> None:
-    """Launch one catch-up scan on start and then honour the saved six-hour cadence."""
+    """Resume transient failures automatically, respecting persisted backoff."""
+    announced = None
     while True:
         try:
             with connect(app.state.db_path) as db:
-                latest = db.execute("SELECT status,finished_at,message FROM scan_runs ORDER BY started_at DESC LIMIT 1").fetchone()
+                latest = db.execute("SELECT id,status,finished_at FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
             if latest is None:
                 launch_scan(app.state.db_path)
             elif latest["status"] != "running" and latest["finished_at"]:
-                try:
-                    finished = datetime.fromisoformat(latest["finished_at"])
-                    if finished.tzinfo is None:
-                        finished = finished.replace(tzinfo=timezone.utc)
-                    due = datetime.now(timezone.utc) - finished.astimezone(timezone.utc) >= timedelta(hours=SCAN_INTERVAL_HOURS)
-                except ValueError:
-                    due = True
-                if due:
+                plan = retry_plan(app.state.db_path)
+                key = (latest["id"], plan["next_scan_at"], plan["requires_login"])
+                if key != announced:
+                    if plan["next_scan_at"]:
+                        local_time = datetime.fromisoformat(plan["next_scan_at"]).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                        report(f"{plan['reason']}: {local_time}. Keep the app open; no restart needed.")
+                    elif plan["reason"]:
+                        report(plan["reason"])
+                    announced = key
+                if plan["next_scan_at"] and datetime.now(timezone.utc) >= datetime.fromisoformat(plan["next_scan_at"]):
+                    report("Automatic scan starting with a fresh Instagram connection.")
                     launch_scan(app.state.db_path)
-        except Exception:
-            # A scan failure must not take down the user's dashboard.
-            pass
+        except Exception as exc:
+            report(f"Scheduler check failed ({type(exc).__name__}); checking again in one minute.")
         await asyncio.sleep(60)
 
 
@@ -105,6 +90,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        configure_progress_logging()
         initialize(database)
         _recover_orphaned_run(database)
         scheduler_task = None
@@ -255,7 +241,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
         if _scan_cooldown_active(database):
             return {
                 "started": False,
-                "message": "The last scan was rate-limited or interrupted. Scan now is paused until the next scheduled scan window.",
+                "message": "The scan is cooling down. Scan now is paused until the next scheduled scan window; it will resume automatically.",
                 **progress,
             }
         launch_scan(database, force_discovery=bool((payload or {}).get("discover", False)))

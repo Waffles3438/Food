@@ -283,6 +283,8 @@
       let message = run?.message || "No scan has run yet. Start one to discover clubs and check Instagram.";
       if (progress.running && run) message = `${run.message || "Scanning"} · ${run.accounts_checked || 0} of ${run.accounts_total || 0} accounts checked · ${run.posts_seen || 0} posts read.`;
       if (!progress.running && run?.status) message += ` ${run.accounts_checked || 0} accounts checked, ${run.posts_seen || 0} posts read, ${run.events_found || 0} events identified.`;
+      if (!progress.running && progress.retry?.next_scan_at) message += ` ${progress.retry.reason}: ${new Date(progress.retry.next_scan_at).toLocaleString()}. Keep the app open.`;
+      if (!progress.running && progress.retry?.requires_login) message += ` ${progress.retry.reason}`;
       if (missing) message += ` ${missing} club listings still need an Instagram handle.`;
       if (progress.accounts?.error) message += ` ${progress.accounts.error} accounts need attention.`;
       $("#scan-message").textContent = message;

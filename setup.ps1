@@ -1,3 +1,7 @@
+param(
+    [ValidateSet("auto", "cpu", "xpu")]
+    [string]$TorchBackend = "auto"
+)
 $ErrorActionPreference = "Stop"
 $repo = $PSScriptRoot
 $venv = Join-Path $repo ".venv"
@@ -84,9 +88,24 @@ if (-not $isExistingVenv) {
 Write-Host "Using Python $($selected.Version) from $venvPython"
 & $venvPython -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "Failed to prepare pip." }
-# CPU-only PyTorch keeps setup usable without a CUDA-enabled GPU.
-& $venvPython -m pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cpu
-if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU-only PyTorch. Retry setup after checking your network connection." }
+# Preserve an existing Intel GPU build, or detect Intel Arc on first setup.
+if ($TorchBackend -eq "auto") {
+    $installedBackend = & $venvPython -c 'import importlib.metadata as m; print(m.version("torch"))' 2>$null
+    $TorchBackend = "cpu"
+    if ("$installedBackend" -match '\+xpu') {
+        $TorchBackend = "xpu"
+    } else {
+        try {
+            $graphics = Get-CimInstance Win32_VideoController -ErrorAction Stop
+            if ($graphics.Name -match 'Intel.*Arc') { $TorchBackend = "xpu" }
+        } catch {
+            Write-Host "GPU detection was unavailable; using CPU. Use -TorchBackend xpu for Intel Arc."
+        }
+    }
+}
+Write-Host "Installing PyTorch backend: $TorchBackend"
+& $venvPython -m pip install -r (Join-Path $repo "requirements-torch-$TorchBackend.txt")
+if ($LASTEXITCODE -ne 0) { throw "Failed to install PyTorch ($TorchBackend). Retry setup after checking your network connection." }
 & $venvPython -m pip install -r (Join-Path $repo "requirements.txt") -r (Join-Path $repo "requirements-ocr.txt")
 if ($LASTEXITCODE -ne 0) { throw "Failed to install application dependencies." }
 Write-Host "Setup finished. Next run: powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1"

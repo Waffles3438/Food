@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Callable, Iterator
 from urllib.parse import urljoin, urlsplit
 
-from foodfinder.events import OCRUnavailableError, ocr_images
+from foodfinder.events import OCRUnavailableError, caption_needs_ocr, ocr_images
 from foodfinder.settings import POST_AGE_DAYS, POST_LIMIT, data_dir
+from foodfinder.progress import report
 
 # Same authenticated timeline query as Profile.get_posts() in pinned Instaloader 4.15.3.
 # Start here instead of doing the unreliable web_profile_info lookup first.
@@ -58,6 +59,25 @@ def collection_failure_kind(exc: BaseException) -> str:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return result
+
+
+def collection_error_detail(exc: BaseException) -> str:
+    """Keep exception types and recognizable HTTP codes, never response text."""
+    pending, seen, codes = [exc], set(), set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        match = re.search(r"\b([45]\d{2})\s+(?:Unauthorized|Forbidden|Too Many Requests|Bad Request|Not Found|Server Error|Bad Gateway|Service Unavailable)", str(current), re.I)
+        if match:
+            codes.add(match.group(1))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    suffix = ", HTTP " + "/".join(sorted(codes)) if codes else ""
+    return type(exc).__name__ + suffix
 
 
 @dataclass(frozen=True)
@@ -203,6 +223,12 @@ def _make_loader(instaloader: object, *, allow_login: bool = False) -> tuple[obj
     # One account, one profile queue and one rate controller per scan.
     session_path = session_files[0]
     username = session_path.name.removeprefix("instaloader-session-")
+    class ReportingRateController(instaloader.RateController):
+        def sleep(self, secs):
+            report(f"Instagram pacing: waiting {secs:.0f}s before the next request.")
+            super().sleep(secs)
+            report("Instagram pacing wait finished; resuming request.")
+
     loader = instaloader.Instaloader(
         quiet=True,
         max_connection_attempts=1,
@@ -217,6 +243,7 @@ def _make_loader(instaloader: object, *, allow_login: bool = False) -> tuple[obj
         save_metadata=False,
         compress_json=False,
         post_metadata_txt_pattern="",
+        rate_controller=ReportingRateController,
     )
     _fail_fast_on_429(loader)
     loader.load_session_from_file(username, str(session_path))
@@ -238,6 +265,7 @@ def _timeline_posts(loader: object, username: str):
             page = connection["page_info"]
             if not isinstance(page["has_next_page"], bool) or (page["has_next_page"] and not page.get("end_cursor")):
                 raise ValueError
+            report(f"@{username}: received timeline page ({len(connection['edges'])} entries).")
             return connection
         except (KeyError, TypeError, ValueError):
             raise InstagramResponseError(
@@ -278,6 +306,7 @@ def _download_post_images(loader: object, post: object, scratch: Path) -> list[s
     # download_post() suppresses errors for Reel covers. Download media directly so
     # 429/authentication failures always reach the scanner and pause its queue.
     for index, url in enumerate(urls):
+        report(f"Post {post.shortcode}: downloading image {index + 1}.")
         loader.download_pic(str(target / f"image-{index:02d}"), url, post.date_local)
     return [str(path) for path in sorted(target.iterdir()) if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}]
 
@@ -333,6 +362,7 @@ def iter_account_sources(
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     cutoff = current.astimezone(timezone.utc) - timedelta(days=age_days)
+    report(f"@{username}: requesting Instagram timeline.")
     posts = _timeline_posts(loader, username)
     account_id = None
 
@@ -347,22 +377,29 @@ def iter_account_sources(
                 post_date = post_date.replace(tzinfo=timezone.utc)
             if post_date < cutoff:
                 # Pinned posts and collaborative announcements need not be in date order.
+                report(f"@{username}: post {posts_seen}/{limit} ({post.shortcode}) is older than {age_days} days; skipped.")
                 continue
+            report(f"@{username}: reading caption for post {posts_seen}/{limit} - https://www.instagram.com/p/{post.shortcode}/")
             images: list[str] = []
             warning = ""
-            try:
-                images = _download_post_images(loader, post, scratch)
-            except Exception as exc:
-                if collection_failure_kind(exc):
-                    raise
-                images = []
-                warning = "Post images could not be read; only the caption was checked."
-            try:
-                media_text = ocr_images(images)
-            except OCRUnavailableError as exc:
-                media_text = exc.partial_text
-                warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
             caption = (post.caption or "").strip()
+            media_text = ""
+            if caption_needs_ocr(caption, posted_at=post_date):
+                report(f"@{username}: post {post.shortcode} needs image text; downloading artwork.")
+                try:
+                    images = _download_post_images(loader, post, scratch)
+                except Exception as exc:
+                    if collection_failure_kind(exc):
+                        raise
+                    images = []
+                    warning = "Post images could not be read; only the caption was checked."
+                try:
+                    media_text = ocr_images(images)
+                except OCRUnavailableError as exc:
+                    media_text = exc.partial_text
+                    warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
+            else:
+                report(f"@{username}: post {post.shortcode} checked from caption; image OCR skipped.")
             yield MediaSource(
                 source_key=f"post:{post.shortcode}",
                 kind="post",
@@ -386,8 +423,10 @@ def iter_account_sources(
             return
 
         # Story access and Story video downloads both use the same authenticated session.
+        report(f"@{username}: checking accessible Stories.")
         for story in loader.get_stories(userids=[account_id]):
             for item in story.get_items():
+                report(f"@{username}: downloading Story media.")
                 with tempfile.TemporaryDirectory(prefix="uoft-food-story-") as story_tmp:
                     story_path = Path(story_tmp)
                     loader.dirname_pattern = str(story_path / "{target}")
@@ -405,6 +444,7 @@ def iter_account_sources(
                     videos = [path for path in files if path.suffix.lower() in {".mp4", ".webm"}]
                     images = [str(path) for path in files if path.suffix.lower() in {".jpg", ".jpeg", ".png"}]
                     for video in videos:
+                        report(f"@{username}: extracting sample frames from Story video.")
                         images.extend(_story_video_frames(str(video), story_path))
                     story_warning = ""
                     try:

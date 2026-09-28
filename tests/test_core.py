@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
+from fixed_clock import EventFixtureDateTime
 
 from foodfinder.database import connect, initialize, link_club_account, upsert_club
 from foodfinder.discovery import Club, fetch_sop_clubs, merge_directory_clubs, parse_sop_page
@@ -252,6 +253,8 @@ class EventExtractionTests(unittest.TestCase):
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch("foodfinder.events.datetime", EventFixtureDateTime))
+        self.enterContext(patch("foodfinder.scanner.datetime", EventFixtureDateTime))
         self.temp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp.name) / "test.sqlite3"
         initialize(self.db_path)

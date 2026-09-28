@@ -5,7 +5,7 @@ A local dashboard that watches St. George student clubs' public Instagram posts 
 ## Quick start (Windows)
 
 1. Install 64-bit Python 3.11, 3.12, or 3.13 from [python.org](https://www.python.org/downloads/windows/), and select **Add python.exe to PATH**. Codex desktop's bundled CPython runtime is also detected if available.
-2. Double-click `setup.ps1` from PowerShell, or run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`. Setup creates `.venv`, installs the app and CPU-only OCR dependencies, and downloads English OCR weights at first run. The PyTorch CPU wheels and OCR models require a sizeable one-time download.
+2. Double-click `setup.ps1` from PowerShell, or run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`. Setup creates `.venv` and installs the app and OCR dependencies. It detects Intel Arc graphics and installs the Intel GPU (XPU) build of PyTorch; otherwise it installs the CPU build. An existing XPU installation is preserved. PyTorch and the English OCR models require a sizeable one-time download.
 3. Run `powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1` and sign in to an Instagram account you control. Instagram may ask for two-factor verification. The password is not stored; Instaloader stores its reusable session outside this repository in its user config directory.
    If Instagram rejects the direct login but you can sign in through a browser, first finish any Instagram security prompts there, then import that browser session explicitly, for example `powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1 -BrowserCookie firefox`. Supported browser names include `edge`, `chrome`, and `firefox`. This reads Instagram cookies from the selected browser and saves the resulting session in the app's local data folder. Recent Chrome on Windows may prevent external tools from decrypting its cookies; if that happens, keep Chrome's encryption enabled and use Firefox for the import instead.
 4. Run `powershell -ExecutionPolicy Bypass -File .\start.ps1` and open `http://127.0.0.1:8000`.
@@ -13,12 +13,14 @@ A local dashboard that watches St. George student clubs' public Instagram posts 
 
 OCR weights download from EasyOCR's model host on first use and are cached locally. Use `--help` with `.venv\Scripts\python.exe -m foodfinder` for the command-line tools.
 
+Keep the PowerShell window open to follow timestamped scan progress. It shows directory pages and club profiles, the current account number, post links, caption-only decisions, image downloads, OCR device and image number, Instagram pacing waits, and a final summary. Post counts also update in the dashboard as each post is saved. If an operation has no new progress for 30 seconds, the terminal repeats its last activity with the elapsed time; that means the process is still running, not that the request has succeeded. Scan messages do not print passwords, session cookies, or post captions. Use **Ctrl+C** in the PowerShell window to stop the app; saved results remain available.
+
 To import a specific browser account, run `./login-instagram.ps1 -BrowserCookie firefox -Username uoftfoodscraper` after signing into that account in Firefox. The import checks the account identity before saving and refuses a different account. Only unexpired Instagram cookies are imported; failed verification leaves the saved session unchanged.
 
 ## What it can access
 
 - The app walks all 36 pages currently linked by the University of Toronto Student Organization Portal and keeps St. George entries. It also reads the UTSU club directory. Clubs without an Instagram handle can be linked manually from **Clubs & scans**.
-- Posts include captions, carousel images, and the displayed covers on video posts. The app OCRs posters locally on CPU and uses local rules to find food, dates, costs, and restrictions. It does not transcribe audio.
+- Posts are checked caption-first. A clear complimentary-food offer with a date, time, and location skips image downloads and OCR. Food or event captions missing these details get image OCR, including all carousel images and Reel covers, using an available Intel GPU with CPU fallback. Empty captions and accessible Stories still get image OCR. Unrelated captions skip images, so offers mentioned only in those images can be missed. Audio is not transcribed.
 - Collection starts with Instaloader's authenticated post-timeline query. It does not call `Profile.from_username()` or `web_profile_info` before reading posts: that profile endpoint has returned immediate 429 responses even on single-account checks. Pagination and rate management still use Instaloader. The query matches the pinned 4.15.3 release; Instagram can change it or refuse access.
 - Stories use the requested club's account ID from its timeline. Empty or restricted timelines that supply no ID are marked as incomplete Story coverage. Collaborative posts never cause the app to check another organizer's Stories.
 - Stories are checked for accounts available to the signed-in user. A Story's media is saved locally as evidence when a matching event is detected, though its Instagram link may expire. Scans happen every six hours, so Stories that disappear between scans may be missed.
@@ -33,14 +35,43 @@ The SQLite database is saved under `%LOCALAPPDATA%\UofTFreeFoodFinder\foodfinder
 
 ## Troubleshooting
 
+- **Automatic recovery:** Keep the app open. Connection failures and unexpected Instagram responses automatically start a fresh scan after 5 minutes, then 15 and 30 minutes for consecutive failures. Further consecutive failures wait six hours. Saved history determines the delay across app restarts; unchecked accounts stay first in the queue. Successful runs restore the normal six-hour cadence. The terminal and dashboard display the next retry time. The scheduler checks once per minute, and missed intervals produce one catch-up scan.
+- **Error details:** New scan failures retain the category, exception type, and recognizable HTTP status without retaining raw error responses or session data. Older ambiguous access errors keep the six-hour delay because their exact cause was not recorded.
+
 - **Python was not found:** Install Python 3.11 or newer and reopen PowerShell.
 - **No session / expired login:** Run `login-instagram.ps1` again. Do not paste your Instagram password into the dashboard.
-- **Login challenge or throttling:** Let Instagram finish the login challenge in your browser, then retry later. A 429 pauses the current queue, including when it occurs while downloading an image or Reel cover. Requests use one attempt; authentication failures, access refusals, and unreadable API responses also pause the queue. **Scan now** is blocked after a rate limit or interrupted run until the next six-hour scan window. Six hours is the app's retry interval, not a promise that Instagram will allow access then. Do not repeatedly restart or use Instagram while it is rate-limiting requests.
+- **Login challenge or throttling:** Complete login challenges in your browser, reimport the session, then select **Scan now**. Authentication failures suspend automatic retries until you take action. A 429 stops the current queue, including when it occurs during media downloads. Rate limits, please-wait restrictions, access refusals, and interrupted runs wait for the six-hour window. Each individual request still gets only one attempt. **Scan now** respects active retry delays. Six hours is the app's retry interval, not a promise that Instagram will allow access then.
 - **Missing poster text:** A media-download failure preserves the caption and marks the account as partially checked. A missing or malformed timeline is reported as a failure rather than a successful empty feed.
 - **OCR initialization or image-reading failure:** The caption and any successfully read poster text are retained, and coverage is marked partial. Model-download progress output is disabled.
 - **401 with “please wait”:** This is treated as a temporary access restriction, rather than proof that the session expired. Collection stops. Finish any prompts in the browser for the same scraper account before reimporting its session.
-- **OCR did not load:** Confirm setup finished and run `setup.ps1` again. The CPU-only PyTorch dependency and OCR model may take several minutes to download.
+- **OCR did not load:** Confirm setup finished and run `setup.ps1` again. PyTorch and the OCR models may take several minutes to download.
 - **No events yet:** Add missing club handles under **Clubs & scans**, scan again, and check **Needs review**. Detection is heuristic; it is not a guarantee of event availability.
+
+## Food keywords
+
+The shared list in `foodfinder/food_keywords.py` includes hamburgers/burgers, BBQ/barbecue, cookies, pizza, hot dogs, donuts/doughnuts, pastries, bagels, muffins, cupcakes, brownies, sandwiches, wraps, tacos, burritos, sushi, dumplings, noodles, pasta, fries, poutine, popcorn, chips, ice cream, candy, fruit, coffee, tea, bubble tea/boba, hot chocolate, juice, lemonade, drinks, snacks, refreshments, and meals. Singular/plural forms and spelling variants are listed explicitly; edit that file and restart the app to extend it.
+
+Matching is case-insensitive. Examples include `free hamburger`, `FREE COOKIES!`, `complimentary BBQ`, `pizza included with admission`, and `#FreeCookies`. A food keyword alone prompts image inspection but does not prove the food is complimentary. `Free cookies!` without a date is retained in **Needs review** if image OCR cannot resolve it. Negated offers, dietary phrases such as `gluten-free pizza`, and unrelated offers such as `free play` are not treated as confirmed free food. Food that is merely "available" needs review. Missing admission or membership details remain unspecified.
+
+## Intel GPU OCR
+
+Run `powershell -ExecutionPolicy Bypass -File .\setup.ps1 -TorchBackend xpu` to explicitly install Intel GPU support. The pinned PyTorch 2.7.1 XPU build supports Intel Arc graphics on Windows with a compatible graphics driver. Hardware detection alone does not guarantee driver or OCR compatibility; the app checks GPU availability at runtime.
+
+`FOODFINDER_OCR_DEVICE` defaults to `auto`, which uses Intel XPU when available and CPU otherwise. To force CPU for a launch, set `$env:FOODFINDER_OCR_DEVICE = "cpu"` in PowerShell before running `start.ps1`. Use `"auto"` to restore automatic selection. `.env.example` documents these settings but is not loaded automatically.
+
+EasyOCR 1.7.2 assumes CUDA in its GPU model loader, so the app loads unquantized models on CPU and moves both text detection and recognition to Intel XPU. A GPU initialization or image-processing failure logs a warning and falls back to CPU; the affected image is retried. If CPU also fails, the existing partial-coverage reporting applies. This speeds up local image processing when supported; Instagram request limits still apply.
+
+Optional GPU image batching is controlled by `$env:FOODFINDER_OCR_BATCH_SIZE = "4"` (range 1-16; default 1). It batches text detection across images from the same post/carousel or Story, then recognizes text in image order. It does not combine different posts or send parallel Instagram requests. Mixed image sizes are padded with white space rather than stretched. Batches above 16 million padded pixels, or batches that fail, are retried as individual images; CPU fallback remains available. The terminal shows batch progress when enabled.
+
+The default stays at **1** because it was fastest on this computer. The Intel Arc 140V benchmark used eight generated posters of mixed 1080x1080 and 1080x1350 sizes, warm-up passes, and two timed passes per setting:
+
+| Images per batch | Average time for eight posters | Peak allocated GPU memory |
+| --- | --- | --- |
+| 1 | 7.75 seconds | 1,211 MiB |
+| 4 | 8.75 seconds | 4,551 MiB |
+| 8 | 8.88 seconds | 9,005 MiB |
+
+All settings returned identical text and ran on XPU, with detector batch dimensions verified during inference. These are local fixture measurements, not an estimate for all Instagram posts; image size, padding, and poster complexity affect throughput. More GPU memory allowed larger batches but did not make these images faster.
 
 ## Development
 

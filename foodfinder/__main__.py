@@ -8,6 +8,7 @@ import sys
 from foodfinder.database import initialize
 from foodfinder.scanner import refresh_directory, run_scan
 from foodfinder.settings import HOST, PORT, database_path
+from foodfinder.progress import configure_progress_logging
 
 
 def main() -> int:
@@ -26,6 +27,7 @@ def main() -> int:
     scan = subcommands.add_parser("scan", help="run a background-free scan now")
     scan.add_argument("--discover", action="store_true", help="also refresh club-directory data")
     args = parser.parse_args()
+    configure_progress_logging()
     initialize(database_path())
 
     if args.command == "serve":

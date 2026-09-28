@@ -139,6 +139,10 @@ def initialize(db_path: Path | str | None = None) -> None:
         existing_event_columns = {row["name"] for row in db.execute("PRAGMA table_info(events)")}
         if "eligibility" not in existing_event_columns:
             db.execute("ALTER TABLE events ADD COLUMN eligibility TEXT NOT NULL DEFAULT ''")
+        scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scan_runs)")}
+        for name in ("failure_kind", "error_detail"):
+            if name not in scan_columns:
+                db.execute(f"ALTER TABLE scan_runs ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
 
 
 def account_for(db: sqlite3.Connection, username: str) -> str:

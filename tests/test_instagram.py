@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import instaloader
 import requests
+from fixed_clock import EventFixtureDateTime
 
 from foodfinder.instagram import (
     InstagramResponseError, TIMELINE_DOC_ID, _download_post_images, _make_loader,
@@ -61,6 +62,32 @@ class TimelineTests(unittest.TestCase):
 
     def sources(self, **kwargs):
         return list(iter_account_sources("@CLUB", loader=self.loader, now=NOW, **kwargs))
+
+    def test_complete_caption_and_irrelevant_post_skip_download_and_ocr(self):
+        for caption in ("Meet our new executive team!", "Free cookies! September 27, 2026 at 6 PM.\nLocation: Student Centre"):
+            with self.subTest(caption=caption):
+                node = media()
+                node["caption"]["text"] = caption
+                with patch("foodfinder.events.datetime", EventFixtureDateTime), patch.object(
+                    self.loader.context, "doc_id_graphql_query", return_value=page([node])
+                ), patch("foodfinder.instagram.ocr_images") as ocr:
+                    source = self.sources(limit=1, include_stories=False)[0]
+                self.assertEqual(source.caption, caption)
+                self.assertEqual(source.media_text, "")
+                self.assertEqual(source.collection_warning, "")
+                self.download.assert_not_called()
+                ocr.assert_not_called()
+
+    def test_incomplete_food_caption_collects_poster_text(self):
+        node = media()
+        node["caption"]["text"] = "Free cookies!"
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([node])), patch(
+            "foodfinder.instagram.ocr_images", return_value="September 27, 2026 at 6 PM. Location: Student Centre"
+        ) as ocr:
+            source = self.sources(limit=1, include_stories=False)[0]
+        self.download.assert_called_once()
+        ocr.assert_called_once()
+        self.assertIn("Student Centre", source.media_text)
 
     def test_one_post_uses_authenticated_timeline_without_profile_or_stories(self):
         with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])) as query:
