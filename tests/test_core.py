@@ -14,7 +14,7 @@ from foodfinder.database import connect, initialize, link_club_account, upsert_c
 from foodfinder.discovery import Club, fetch_sop_clubs, merge_directory_clubs, parse_sop_page
 from foodfinder.events import extract_events
 from foodfinder.instagram import MediaSource, _checkpoint_url, _fail_fast_on_429, _import_browser_session
-from foodfinder.scanner import get_event, list_events, patch_event, process_source, refresh_directory, run_scan, upsert_manual_club
+from foodfinder.scanner import event_counts, get_event, list_events, patch_event, process_source, refresh_directory, run_scan, upsert_manual_club
 
 
 TORONTO = ZoneInfo("America/Toronto")
@@ -290,6 +290,49 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(len(events[0]["supporting_sources"]), 2)
 
+    def test_same_account_events_at_same_date_and_time_show_once(self):
+        with connect(self.db_path) as db:
+            other_account_id = link_club_account(db, self.club_id, "anotherbakingclub")
+        fixtures = [
+            ("source-one", self.account_id, "event-one", "AND:", "post:one", "https://www.instagram.com/p/one/", "2026-09-27", "11:00"),
+            ("source-two", self.account_id, "event-two", "TRAINEE", "post:two", "https://www.instagram.com/p/two/", "2026-09-27", "11:00"),
+            ("source-three", self.account_id, "event-three", "Lunch", "post:three", "https://www.instagram.com/p/three/", "2026-09-27", "12:00"),
+            ("source-four", other_account_id, "event-four", "Other club", "post:four", "https://www.instagram.com/p/four/", "2026-09-27", "11:00"),
+        ]
+        with connect(self.db_path) as db:
+            for source_id, account_id, event_id, title, source_key, url, event_day, event_time in fixtures:
+                db.execute(
+                    """INSERT INTO sources(id,account_id,source_key,kind,url,posted_at,checked_at)
+                       VALUES (?,?,?,'story',?,?,?)""",
+                    (source_id, account_id, source_key, url, POSTED.isoformat(), POSTED.isoformat()),
+                )
+                db.execute(
+                    """INSERT INTO events(id,source_id,event_key,title,event_date,event_time,food,
+                       food_confidence,status,updated_at) VALUES (?,?,?,?,?,?,'Pizza','high','upcoming',?)""",
+                    (event_id, source_id, event_id, title, event_day, event_time, POSTED.isoformat()),
+                )
+                db.execute(
+                    "INSERT INTO evidence(event_id,source_id,excerpt,created_at) VALUES (?,?,?,?)",
+                    (event_id, source_id, "Free pizza", POSTED.isoformat()),
+                )
+
+        events = list_events(db_path=self.db_path)
+        self.assertEqual(len(events), 3)
+        merged = next(event for event in events if event["event_time"] == "11:00" and event["username"] == "bakingclub")
+        self.assertEqual(merged["title"], "TRAINEE")
+        self.assertEqual({source["url"] for source in merged["supporting_sources"]}, {
+            "https://www.instagram.com/p/one/", "https://www.instagram.com/p/two/",
+        })
+        self.assertEqual(event_counts(self.db_path)["upcoming"], 3)
+
+        patch_event(merged["id"], {"status": "dismissed"}, self.db_path)
+        with connect(self.db_path) as db:
+            statuses = db.execute(
+                "SELECT status FROM events WHERE id IN ('event-one','event-two') ORDER BY id"
+            ).fetchall()
+        self.assertEqual([row["status"] for row in statuses], ["dismissed", "dismissed"])
+        self.assertEqual(len(list_events(db_path=self.db_path)), 2)
+
     def test_empty_sources_are_cached_and_failed_reads_remain_retryable(self):
         for warning, expected_version in (("", 1), ("OCR incomplete", 0)):
             source = MediaSource("post:empty", "post", "https://www.instagram.com/p/empty/",
@@ -299,6 +342,33 @@ class PersistenceTests(unittest.TestCase):
                 row = db.execute("SELECT cache_version,ocr_complete FROM sources WHERE source_key='post:empty'").fetchone()
             self.assertEqual(row["cache_version"], expected_version)
             self.assertEqual(row["ocr_complete"], 0)
+
+    def test_similar_titles_same_day_merge_across_accounts_without_times(self):
+        fixtures = [
+            ('reposterone', 'APSA MOVIE NIGHT:', 'September 27 2026'),
+            ('repostertwo', 'APSA MOVIE NlGHT!', 'September 27 2026'),
+            ('anotherday', 'APSA MOVIE NIGHT', 'September 28 2026'),
+            ('unrelated', 'Board games social', 'September 27 2026'),
+        ]
+        for username, title, day in fixtures:
+            with connect(self.db_path) as db:
+                club = upsert_club(db, source_key=f'manual:{username}', name=username)
+                account = link_club_account(db, club, username)
+            process_source(self.db_path, account, username, MediaSource(
+                f'post:{username}', 'post', f'https://www.instagram.com/p/{username}/',
+                f'{title}\nFree popcorn!\n{day}', '', POSTED.isoformat(),
+            ))
+        events = list_events(db_path=self.db_path)
+        self.assertEqual(len(events), 3)
+        merged = next(row for row in events if len(row['supporting_sources']) == 2)
+        self.assertEqual({source['username'] for source in merged['supporting_sources']},
+                         {'reposterone', 'repostertwo'})
+        self.assertEqual(event_counts(self.db_path)['upcoming'], 3)
+        corrected = patch_event(merged['id'], {'title': 'APSA screening'}, self.db_path)
+        self.assertEqual(len(corrected['supporting_sources']), 2)
+        self.assertEqual(len(list_events(db_path=self.db_path)), 3)
+        patch_event(merged['id'], {'status': 'dismissed'}, self.db_path)
+        self.assertEqual(len(list_events(db_path=self.db_path)), 2)
 
     def test_changing_a_post_moves_old_offer_to_review(self):
         source = MediaSource(

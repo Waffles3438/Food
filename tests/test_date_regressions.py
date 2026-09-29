@@ -40,3 +40,15 @@ class DateRegressionTests(unittest.TestCase):
     def test_explicit_year_and_dotted_time(self):
         self.assertEqual(str(_extract_dates('September 17, 2025', self.posted, self.now)[0][0]), '2025-09-17')
         self.assertEqual(_extract_times('5.30pm'), ['17:30'])
+
+    def test_day_first_poster_date_and_dotted_24_hour_start(self):
+        for date_text in ('30.SEP2026', '30.SEP.2026', '30 September 2026'):
+            with self.subTest(date_text=date_text):
+                events = extract_events(
+                    f'The Anatomy of Admission\n{date_text}\n17.00\n'
+                    'Drinks on us\nTIMELINE\n17.00\n17:10\nWELCOME',
+                    posted_at=self.posted, account_name='patientzero.uoft', now=self.now,
+                )
+                self.assertEqual(events[0].event_date, '2026-09-30')
+                self.assertEqual(events[0].event_time, '17:00')
+        self.assertEqual(_extract_times('$17.00 tickets'), [])

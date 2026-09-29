@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#123e32">
   <title>Free Food Finder · U of T</title>
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/app.css?v=20260928-compact-filters">
 </head>
 <body>
   <header class="topbar">
@@ -51,9 +51,6 @@
         <button class="tab" data-view="review" type="button">Needs review <span id="tab-review">0</span></button>
       </nav>
       <form id="filters" class="filters">
-        <label class="filter-field"><span>CLUB</span><select id="club-filter"><option value="">All clubs</option></select></label>
-        <label class="filter-field"><span>FROM</span><input id="from-filter" type="date"></label>
-        <label class="filter-field"><span>TO</span><input id="to-filter" type="date"></label>
         <label class="filter-field" id="review-sort-field" hidden><span>EVENT DATE</span><select id="review-sort"><option value="newest">Newest to oldest</option><option value="oldest">Oldest to newest</option></select></label>
         <label class="check-field"><input id="free-entry" type="checkbox"><span>Free entry</span></label>
         <label class="check-field"><input id="unrestricted-entry" type="checkbox"><span>Open to everyone</span></label>
@@ -89,6 +86,6 @@
     <footer class="footer"><span>Made for students who ask <em>“is there free food?”</em></span><span>All dates in Toronto time · Club posts may change</span></footer>
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v=20260928-filter-controls" defer></script>
 </body>
 </html>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -472,7 +473,7 @@ def _event_rows(db, ids, *, summary=False):
     for offset in range(0, len(ids), 500):
         batch = ids[offset:offset + 500]
         marks = ",".join("?" for _ in batch)
-        fields = "e.id,e.title,e.event_date" if summary else "e.*,s.kind AS source_kind,s.url AS source_url,s.caption,s.media_text,s.posted_at,s.expires_at,a.username"
+        fields = "e.id,e.title,e.event_date,e.event_time,e.food_confidence,e.review_reason,e.food,e.location,a.username" if summary else "e.*,s.kind AS source_kind,s.url AS source_url,s.caption,s.media_text,s.posted_at,s.expires_at,a.username"
         rows = db.execute(f"""SELECT {fields}, GROUP_CONCAT(DISTINCT c.name) AS club_names
             FROM events e JOIN sources s ON s.id=e.source_id JOIN accounts a ON a.id=s.account_id
             LEFT JOIN club_accounts ca ON ca.account_id=a.id LEFT JOIN clubs c ON c.id=ca.club_id
@@ -500,7 +501,17 @@ def _event_rows(db, ids, *, summary=False):
 def get_event(event_id: str, db_path: Path | str | None = None) -> dict[str, Any] | None:
     with connect(db_path) as db:
         rows = _event_rows(db, [event_id])
-    return rows[0] if rows else None
+        if not rows:
+            return None
+        event = rows[0]
+        if event["status"] not in {"dismissed", "cancelled", "duplicate"}:
+            ids = [row["id"] for row in db.execute(
+                "SELECT id FROM events WHERE status NOT IN ('dismissed','cancelled','duplicate')",
+            )]
+            for group in _event_groups(_event_rows(db, ids)):
+                if any(row["id"] == event_id for row in group):
+                    return _combine_event_group(group, preferred_id=event_id)
+    return event
 
 
 def event_counts(db_path=None):
@@ -553,7 +564,109 @@ def dismiss_expired_events(db_path: Path | str | None = None, *, now: datetime |
                 (utcnow(), *due),
             )
             return cursor.rowcount
-        return 0
+    return 0
+
+
+def _same_account_event_key(event: dict[str, Any]) -> tuple[str, str, str] | None:
+    username = str(event.get("username") or "").strip().casefold()
+    event_day = str(event.get("event_date") or "").strip()
+    event_time = str(event.get("event_time") or "").strip()
+    if not username or not event_day or not event_time:
+        return None
+    return username, event_day, event_time
+
+
+def _event_quality(event: dict[str, Any]) -> tuple[int, int, int, int, int, int]:
+    title = " ".join(str(event.get("title") or "").split())
+    return (
+        int(event.get("food_confidence") == "high"),
+        int(not event.get("review_reason")),
+        int(bool(event.get("food"))),
+        int(bool(event.get("location"))),
+        len(title.split()),
+        len(title),
+    )
+
+
+def _events_match(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    if not left.get("event_date") or left["event_date"] != right.get("event_date"):
+        return False
+    key = _same_account_event_key(left)
+    if key is not None and key == _same_account_event_key(right):
+        return True
+    titles = [" ".join(re.findall(r"\w+", str(row.get("title") or "").casefold()))
+              for row in (left, right)]
+    if any(len(title) < 6 or title == "club event" for title in titles):
+        return False
+    return SequenceMatcher(None, *titles, autojunk=False).ratio() >= 0.90
+
+
+def _event_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    positions = {row["id"]: index for index, row in enumerate(rows)}
+    # Stable membership for lists, counts, and editing; avoid chains of weak matches.
+    for row in sorted(rows, key=lambda item: item["id"]):
+        if not row.get("event_date"):
+            continue
+        for group in groups:
+            if all(_events_match(row, member) for member in group):
+                group.append(row)
+                break
+        else:
+            groups.append([row])
+    # Resolve missing dates only against a single dated group. Never let an
+    # undated repost bridge different dates or make later matches ambiguous.
+    dated_groups = [list(group) for group in groups]
+    for row in sorted(rows, key=lambda item: item["id"]):
+        if row.get("event_date"):
+            continue
+        matches = [index for index, group in enumerate(dated_groups)
+                   if all(_undated_event_matches(row, member) for member in group)]
+        if len(matches) == 1:
+            groups[matches[0]].append(row)
+        else:
+            groups.append([row])
+    return sorted(groups, key=lambda group: min(positions[row["id"]] for row in group))
+
+
+def _undated_event_matches(undated: dict[str, Any], dated: dict[str, Any]) -> bool:
+    titles = [" ".join(re.findall(r"\w+", str(row.get("title") or "").casefold()))
+              for row in (undated, dated)]
+    if any(len(title) < 10 or len(title.split()) < 2 or title == "club event" for title in titles):
+        return False
+    if undated.get("event_time") and dated.get("event_time") and undated["event_time"] != dated["event_time"]:
+        return False
+    return SequenceMatcher(None, *titles, autojunk=False).ratio() >= 0.96
+
+
+def _combine_event_group(group: list[dict[str, Any]], *, preferred_id: str = "") -> dict[str, Any]:
+    dated = [row for row in group if row.get("event_date")]
+    candidates = dated or group
+    representative = next((row for row in candidates if row["id"] == preferred_id), None)
+    result = dict(representative or max(candidates, key=_event_quality))
+    if preferred_id:
+        result["id"] = preferred_id
+    result["supporting_sources"] = _merge_supporting_sources(
+        *(row.get("supporting_sources", []) for row in group)
+    )
+    return result
+
+
+def _merge_supporting_sources(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for group in groups:
+        for source in group:
+            username = str(source.get("username") or "").strip().casefold()
+            kind = str(source.get("kind") or "").strip().casefold()
+            url = str(source.get("url") or "").strip()
+            fallback = str(source.get("posted_at") or source.get("excerpt") or "").strip()
+            key = (username, kind, url or fallback)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(source)
+    return merged
 
 
 def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None = None) -> dict[str, Any] | None:
@@ -566,17 +679,35 @@ def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None
     if "status" in patch and patch["status"] not in {"upcoming", "cancelled", "dismissed"}:
         raise ValueError("status must be upcoming, cancelled, or dismissed.")
     with connect(db_path) as db:
-        row = db.execute("SELECT manual_overrides_json FROM events WHERE id=?", (event_id,)).fetchone()
+        row = db.execute(
+            """SELECT e.id,e.title,e.event_date,e.event_time,e.manual_overrides_json,a.username
+               FROM events e JOIN sources s ON s.id=e.source_id
+               JOIN accounts a ON a.id=s.account_id WHERE e.id=?""",
+            (event_id,),
+        ).fetchone()
         if not row:
             return None
-        overrides = json.loads(row["manual_overrides_json"] or "{}")
-        overrides.update({key: str(value).strip() for key, value in patch.items()})
+        related = [row]
+        candidates = db.execute(
+            """SELECT e.id,e.title,e.event_date,e.event_time,e.manual_overrides_json,a.username FROM events e
+               JOIN sources s ON s.id=e.source_id
+               JOIN accounts a ON a.id=s.account_id
+               WHERE e.status NOT IN ('cancelled','dismissed','duplicate')""",
+        ).fetchall()
+        for group in _event_groups([dict(item) for item in candidates]):
+            if any(item["id"] == event_id for item in group):
+                related = group
+                break
         updates = ", ".join(f"{FIELD_MAP[key]}=?" for key in patch)
-        if updates:
-            db.execute(
-                f"UPDATE events SET {updates}, manual_overrides_json=?, updated_at=? WHERE id=?",
-                (*[str(value).strip() for value in patch.values()], _json(overrides), utcnow(), event_id),
-            )
+        if updates or patch:
+            values = [str(value).strip() for value in patch.values()]
+            for item in related:
+                overrides = json.loads(item["manual_overrides_json"] or "{}")
+                overrides.update({key: str(value).strip() for key, value in patch.items()})
+                db.execute(
+                    f"UPDATE events SET {updates}, manual_overrides_json=?, updated_at=? WHERE id=?",
+                    (*values, _json(overrides), utcnow(), item["id"]),
+                )
     dismiss_expired_events(db_path)
     return get_event(event_id, db_path)
 
@@ -616,9 +747,6 @@ def list_events(
         params.append(today)
         if view != "review":
             clauses.append("e.review_reason=''")
-    if club:
-        clauses.append("EXISTS (SELECT 1 FROM club_accounts cx JOIN clubs cc ON cc.id=cx.club_id WHERE cx.account_id=s.account_id AND cc.id=? )")
-        params.append(club)
     if from_date:
         clauses.append("e.event_date>=?")
         params.append(from_date)
@@ -635,16 +763,25 @@ def list_events(
         + " ORDER BY CASE WHEN e.event_date='' THEN 1 ELSE 0 END, e.event_date, e.event_time, e.updated_at DESC"
     )
     with connect(db_path) as db:
-        ids = [row["id"] for row in db.execute(query, params)]
+        eligible_ids = {row["id"] for row in db.execute(query, params)}
+        ids = [row["id"] for row in db.execute(
+            "SELECT id FROM events WHERE status NOT IN ('cancelled','dismissed','duplicate') "
+            "ORDER BY CASE WHEN event_date='' THEN 1 ELSE 0 END, event_date,event_time,updated_at DESC"
+        )]
+        club_ids = {row["id"] for row in db.execute(
+            "SELECT e.id FROM events e JOIN sources s ON s.id=e.source_id "
+            "JOIN club_accounts ca ON ca.account_id=s.account_id WHERE ca.club_id=?", (club,)
+        )} if club else None
         event_rows = _event_rows(db, ids, summary=_summary)
-    seen: set[tuple[str, str, str]] = set()
-    results: list[dict[str, Any]] = []
-    for result in event_rows:
-        key = (result["title"].casefold(), result["event_date"], "|".join(sorted((result.get("club_names") or "").split(","))))
-        if key in seen:
+    groups = _event_groups(event_rows)
+    results = []
+    for group in groups:
+        event = _combine_event_group(group)
+        if event["id"] not in eligible_ids:
             continue
-        seen.add(key)
-        results.append(result)
+        if club_ids is not None and not any(row["id"] in club_ids for row in group):
+            continue
+        results.append(event)
     return results
 
 

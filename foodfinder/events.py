@@ -261,6 +261,9 @@ def _valid_food_claim(text: str) -> re.Match[str] | None:
 
 def _extract_times(text: str) -> list[str]:
     period = r"(?:a\.?m\.?|p\.?m\.?)"
+    # Posters and OCR often use a dot instead of a colon in 24-hour times.
+    text = re.sub(r"(?<![\w.$])([01]\d|2[0-3])\.([0-5]\d)(?![\w.])",
+                  r"\1:\2", text)
     text = re.sub(r"\b(\d{1,2})[.]([0-5]\d)\s*(a\.?m\.?|p\.?m\.?)\b",
                   r"\1:\2\3", text, flags=re.I)
 
@@ -313,6 +316,19 @@ def _extract_dates(text: str, posted_at: datetime, now: datetime) -> list[tuple[
                 break
             except ValueError:
                 continue
+    # Day-first poster dates may lose spaces or punctuation during OCR.
+    for match in re.finditer(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?[.\s/-]+"
+        r"(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+        r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"(?:[.\s/-]*(\d{4}))?\b", text, re.I,
+    ):
+        day, month, year = match.groups()
+        cleaned = f"{day} {month[:3]} {year or local_base.year}"
+        try:
+            parsed.append((datetime.strptime(cleaned, "%d %b %Y").date(), match.group()))
+        except ValueError:
+            continue
     for match in re.finditer(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})\b", text):
         for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
             try:

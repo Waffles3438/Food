@@ -1,7 +1,8 @@
 (() => {
   const $ = (selector, parent = document) => parent.querySelector(selector);
   const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
-  const state = { view: "upcoming", clubs: [], refreshTimer: null, toastTimer: null, clubFilter: "", clubRefreshRun: "" };
+  const CLUB_PAGE_SIZE = 40;
+  const state = { view: "upcoming", clubs: [], clubRows: [], clubMatches: [], clubPage: 0, refreshTimer: null, toastTimer: null, clubFilter: "", clubRefreshRun: "" };
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -62,12 +63,6 @@
 
   function eventURL() {
     const query = new URLSearchParams({ view: state.view });
-    const club = $("#club-filter").value;
-    const from = $("#from-filter").value;
-    const to = $("#to-filter").value;
-    if (club) query.set("club", club);
-    if (from) query.set("from_date", from);
-    if (to) query.set("to_date", to);
     if ($("#free-entry").checked) query.set("free_entry", "true");
     if ($("#unrestricted-entry").checked) query.set("unrestricted_entry", "true");
     return `/api/events?${query}`;
@@ -277,19 +272,61 @@
   async function loadClubs() {
     try {
       state.clubs = await api("/api/clubs");
-      const select = $("#club-filter");
-      const previous = select.value;
-      select.replaceChildren(new Option("All clubs", ""));
-      state.clubs.filter((club) => club.active).forEach((club) => select.add(new Option(club.name, club.id)));
-      select.value = previous;
-      const search = $("#club-search").value.toLocaleLowerCase();
-      const visible = state.clubs.filter((club) => !search || `${club.name} ${club.instagram_username}`.toLocaleLowerCase().includes(search));
-      const container = $("#clubs");
-      container.replaceChildren();
-      visible.forEach((club) => container.append(renderClub(club)));
-      $("#club-directory-count").textContent = `${state.clubs.length} club listings`;
+      state.clubRows = state.clubs.map((club) => ({
+        club,
+        searchText: `${club.name} ${club.instagram_username || ""}`.toLocaleLowerCase(),
+        element: null,
+      }));
+      filterClubs();
       $("#stat-clubs").textContent = state.clubs.filter((club) => club.instagram_username && club.active).length;
     } catch (error) { showToast(`Could not load clubs: ${error.message}`); }
+  }
+
+  function filterClubs() {
+    const search = $("#club-search").value.trim().toLocaleLowerCase();
+    state.clubMatches = state.clubRows.filter((row) => row.searchText.includes(search));
+    state.clubPage = 0;
+    renderClubPage();
+  }
+
+  function renderClubPage() {
+    const total = state.clubMatches.length;
+    const pageCount = Math.ceil(total / CLUB_PAGE_SIZE);
+    const start = state.clubPage * CLUB_PAGE_SIZE;
+    const visible = state.clubMatches.slice(start, start + CLUB_PAGE_SIZE);
+    $("#clubs").replaceChildren(...visible.map((row) => {
+      row.element ||= renderClub(row.club);
+      return row.element;
+    }));
+    if (!total) $("#clubs").append(node("p", "empty-state", "No clubs match your search."));
+    $("#club-directory-count").textContent = total
+      ? `${start + 1}–${Math.min(start + CLUB_PAGE_SIZE, total)} of ${total} clubs`
+      : "0 matching clubs";
+    $("#club-pagination").hidden = pageCount <= 1;
+    $("#club-previous").disabled = state.clubPage === 0;
+    $("#club-next").disabled = state.clubPage + 1 >= pageCount;
+    const pageNumbers = $("#club-page-numbers");
+    const pages = pageCount <= 7
+      ? Array.from({ length: pageCount }, (_, index) => index)
+      : [...new Set([0, state.clubPage - 1, state.clubPage, state.clubPage + 1, pageCount - 1])]
+        .filter((page) => page >= 0 && page < pageCount).sort((left, right) => left - right);
+    const controls = [];
+    let previousPage = -1;
+    pages.forEach((page) => {
+      if (previousPage >= 0 && page - previousPage > 1) controls.push(node("span", "club-page-ellipsis", "…"));
+      const button = node("button", "club-page-number", String(page + 1));
+      button.type = "button";
+      button.setAttribute("aria-label", `Page ${page + 1}`);
+      if (page === state.clubPage) {
+        button.setAttribute("aria-current", "page");
+        button.disabled = true;
+      } else {
+        button.addEventListener("click", () => { state.clubPage = page; renderClubPage(); });
+      }
+      controls.push(button);
+      previousPage = page;
+    });
+    pageNumbers.replaceChildren(...controls);
   }
 
   function renderClub(club) {
@@ -375,7 +412,27 @@
     });
     $("#add-club").addEventListener("click", () => openClubForm());
     $("#cancel-club").addEventListener("click", () => $("#club-form").classList.add("hidden"));
-    $("#club-search").addEventListener("input", loadClubs);
+    const pagination = node("nav", "club-pagination");
+    pagination.id = "club-pagination";
+    pagination.setAttribute("aria-label", "Club list pages");
+    pagination.hidden = true;
+    const previous = node("button", "button button-light", "Previous page");
+    previous.id = "club-previous"; previous.type = "button";
+    previous.addEventListener("click", () => {
+      if (state.clubPage > 0) { state.clubPage--; renderClubPage(); }
+    });
+    const pageNumbers = node("div", "club-page-numbers");
+    pageNumbers.id = "club-page-numbers";
+    const next = node("button", "button button-light", "Next page");
+    next.id = "club-next"; next.type = "button";
+    next.addEventListener("click", () => {
+      if ((state.clubPage + 1) * CLUB_PAGE_SIZE < state.clubMatches.length) {
+        state.clubPage++; renderClubPage();
+      }
+    });
+    pagination.append(previous, pageNumbers, next);
+    $("#clubs").after(pagination);
+    $("#club-search").addEventListener("input", filterClubs);
     $("#club-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const id = $("#club-edit-id").value;

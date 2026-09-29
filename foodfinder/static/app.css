@@ -21,3 +21,10 @@
 .badge{font-size:11px}
 .event-desc{font-size:14px}
 .source-caption{font-size:13px}
+.club-pagination{display:flex;justify-content:center;align-items:center;gap:8px;margin-top:12px}
+.club-pagination[hidden]{display:none}
+.club-pagination button:disabled{opacity:.5;cursor:default;transform:none}
+.club-page-numbers{display:flex;align-items:center;gap:4px}
+.club-pagination .club-page-number{min-width:34px;padding:8px 10px;border:0;border-radius:8px;background:transparent;color:var(--forest);font:500 13px var(--sans);cursor:pointer}
+.club-pagination .club-page-number[aria-current=page]{background:var(--mint);font-weight:700}
+.club-page-ellipsis{padding:0 4px;color:var(--muted)}
