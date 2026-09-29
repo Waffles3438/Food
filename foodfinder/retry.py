@@ -43,8 +43,8 @@ def retry_plan(db_path, now=None) -> dict:
         minutes = 6 * 60
         reason = "Automatic retry after the six-hour HTTP 429 cooldown"
     elif failed:
-        minutes = 5
-        reason = "Automatic retry after the five-minute failure cooldown"
+        minutes = 1
+        reason = "Automatic retry after the one-minute failure cooldown"
         if kind == "authentication":
             reason = "Login needs attention; reimport the browser session if needed. Automatic retry"
     try:

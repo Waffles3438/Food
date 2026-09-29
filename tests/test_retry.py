@@ -34,7 +34,7 @@ class RetryTests(unittest.TestCase):
         return ended
 
     def test_repeated_failures_always_wait_five_minutes_across_rereads(self):
-        for delay in (5, 5, 5, 5, 5):
+        for delay in (1, 1, 1, 1, 1):
             ended = self.add("connection")
             plan = retry_plan(self.path, now=ended)
             self.assertEqual(datetime.fromisoformat(plan["next_scan_at"]), ended + timedelta(minutes=delay))
@@ -43,7 +43,7 @@ class RetryTests(unittest.TestCase):
             self.assertFalse(retry_plan(self.path, now=ended + timedelta(minutes=delay))["cooldown"])
         self.add("", status="complete")
         ended = self.add("response")
-        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=1))
 
     def test_only_http_429_waits_six_hours(self):
         for kind in ("rate_limit", "temporary_limit", "access", "interrupted"):
@@ -53,7 +53,7 @@ class RetryTests(unittest.TestCase):
     def test_authentication_retries_with_login_hint_and_running_scan_has_no_retry(self):
         ended = self.add("authentication")
         self.assertTrue(retry_plan(self.path)["requires_login"])
-        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=5))
+        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=1))
         self.add("", status="running")
         self.assertEqual(retry_plan(self.path)["next_scan_at"], "")
 
@@ -61,7 +61,7 @@ class RetryTests(unittest.TestCase):
         for status in ("partial", "error"):
             ended = self.add("", status=status)
             plan = retry_plan(self.path, now=ended)
-            self.assertEqual(datetime.fromisoformat(plan["next_scan_at"]), ended + timedelta(minutes=5))
+            self.assertEqual(datetime.fromisoformat(plan["next_scan_at"]), ended + timedelta(minutes=1))
             self.assertTrue(plan["cooldown"])
 
     def test_success_uses_configured_interval_but_429_always_uses_six_hours(self):
@@ -119,7 +119,7 @@ class AutomaticRetryTests(unittest.IsolatedAsyncioTestCase):
             launch.assert_called_once_with(str(path))
 
     async def test_scheduler_does_not_retry_before_failure_cooldown(self):
-        for kind, age in (("response", 1), ("authentication", 1), ("rate_limit", 6)):
+        for kind, age in (("response", 1), ("authentication", 0.5), ("rate_limit", 6)):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder) / "test.sqlite3"
                 initialize(path)

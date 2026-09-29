@@ -260,9 +260,21 @@ def _valid_food_claim(text: str) -> re.Match[str] | None:
 
 
 def _extract_times(text: str) -> list[str]:
-    text = re.sub(r"\b(\d{1,2})[.]([0-5]\d)\s*(am|pm)\b", r"\1:\2\3", text, flags=re.I)
-    text = re.sub(r"\b(\d{1,2})(?::(\d{2}))?\s*[-–]\s*(\d{1,2}(?::\d{2})?)\s*(am|pm)\b",
-                  lambda m: f"{m[1]}{(':' + m[2]) if m[2] else ''}{m[4]}-{m[3]}{m[4]}", text, flags=re.I)
+    period = r"(?:a\.?m\.?|p\.?m\.?)"
+    text = re.sub(r"\b(\d{1,2})[.]([0-5]\d)\s*(a\.?m\.?|p\.?m\.?)\b",
+                  r"\1:\2\3", text, flags=re.I)
+
+    def normalize_time_range(match):
+        start, end, suffix = match.groups()
+        suffix = "pm" if suffix.lower().startswith("p") else "am"
+        return f"{start}{suffix}-{end}{suffix}"
+
+    text = re.sub(
+        rf"\b(\d{{1,2}}(?::\d{{2}})?)\s*[-–]\s*(\d{{1,2}}(?::\d{{2}})?)\s*({period})\b",
+        normalize_time_range,
+        text,
+        flags=re.I,
+    )
     found: list[str] = []
     for m in TIME_PATTERN.finditer(text):
         if m.group(1):

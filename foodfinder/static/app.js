@@ -37,7 +37,6 @@
 
   async function loadCounts() {
     const counts = await api("/api/event-counts");
-    $("#stat-review").textContent = counts.review;
     $("#tab-review").textContent = counts.review;
     $("#tab-today").textContent = counts.today;
     $("#stat-upcoming").textContent = counts.upcoming;
@@ -151,9 +150,9 @@
     main.append(node("p", "club-label", (event.club_names || event.username || "U of T club").split(",").map((v) => v.trim()).filter(Boolean).join(" · ")));
     main.append(node("h3", "event-title", event.title || "Club event"));
     const description = node("div", "event-desc");
-    if (event.event_date) description.append(node("span", "", `◷ ${d.full}${event.event_time ? ` · ${formatTime(event.event_time)}` : ""}`));
-    if (event.location) description.append(node("span", "", `⌖ ${event.location}`));
-    if (event.food) description.append(node("span", "", `✳ ${event.food}`));
+    if (event.event_date) description.append(node("span", "event-detail-emphasis", `◷ ${d.full}${event.event_time ? ` · ${formatTime(event.event_time)}` : ""}`));
+    if (event.location) description.append(node("span", "event-detail-emphasis", `⌖ ${event.location}`));
+    if (event.food) description.append(node("span", "event-detail-emphasis", `✳ ${event.food}`));
     if (!event.food && event.food_confidence === "low") description.append(node("span", "", "Food offer needs confirmation"));
     main.append(description);
     const badges = node("div", "event-badges");
@@ -229,8 +228,6 @@
       sources.slice(0, 8).forEach((source, index) => sourceRow.append(makeSourceLink(source, index)));
       if (sources.length > 8) sourceRow.append(node("span", "muted", `+${sources.length - 8} more`));
       card.append(sourceRow);
-      const excerpt = sources.find((source) => source.excerpt)?.excerpt;
-      if (excerpt) card.append(node("p", "source-caption", excerpt));
     }
     return card;
   }

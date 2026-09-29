@@ -36,6 +36,9 @@ def collection_failure_kind(exc: BaseException) -> str:
             continue
         seen.add(id(current))
         name, message = type(current).__name__, str(current).casefold()
+        stored_kind = getattr(current, "failure_kind", "")
+        if stored_kind in {"rate_limit", "temporary_limit", "authentication", "access"}:
+            return stored_kind
         if name in {"TooManyRequestsException", "QueryReturnedTooManyRequestsException"} or re.search(r"\b429\b", message):
             return "rate_limit"
         if "please wait" in message or "feedback_required" in message:
@@ -76,6 +79,9 @@ def collection_error_detail(exc: BaseException) -> str:
             pending.append(current.__cause__)
         if current.__context__ is not None:
             pending.append(current.__context__)
+    diagnostic = getattr(exc, "diagnostic", "")
+    if diagnostic and re.fullmatch(r"[A-Za-z0-9_ ;=.,-]{1,240}", diagnostic):
+        return type(exc).__name__ + ", " + diagnostic
     suffix = ", HTTP " + "/".join(sorted(codes)) if codes else ""
     return type(exc).__name__ + suffix
 
@@ -261,16 +267,37 @@ def _timeline_posts(loader: object, username: str):
     def edges(response):
         try:
             connection = response["data"]["xdt_api__v1__feed__user_timeline_graphql_connection"]
-            if response.get("errors") or not isinstance(connection["edges"], list):
+            if not isinstance(connection, dict) or not isinstance(connection.get("edges"), list):
                 raise ValueError
-            page = connection["page_info"]
-            if not isinstance(page["has_next_page"], bool) or (page["has_next_page"] and not page.get("end_cursor")):
+            # Match Instaloader's iterator behavior: page_info is optional, and
+            # non-boolean truthy flags are accepted by its own paginator.
+            page = connection.get("page_info") or {}
+            if not isinstance(page, dict):
                 raise ValueError
+            if response.get("errors"):
+                kind, diagnostic = _timeline_response_diagnostic(response)
+                if kind != "response":
+                    raise InstagramResponseError(
+                        "Instagram reported an account access restriction.",
+                        failure_kind=kind,
+                        diagnostic=diagnostic,
+                    )
+                report(f"@{username}: Instagram returned partial GraphQL errors with readable timeline data; continuing with available posts.")
+            if page.get("has_next_page") and not page.get("end_cursor"):
+                kind, diagnostic = _timeline_response_diagnostic(response)
+                raise InstagramResponseError(
+                    "Instagram timeline pagination did not include a continuation cursor.",
+                    failure_kind=kind,
+                    diagnostic=diagnostic,
+                )
             report(f"@{username}: received timeline page ({len(connection['edges'])} entries).")
             return connection
         except (KeyError, TypeError, ValueError):
+            kind, diagnostic = _timeline_response_diagnostic(response)
             raise InstagramResponseError(
-                "Instagram did not return a readable post timeline. Check the saved browser login; the API may have changed."
+                "Instagram did not return a readable post timeline.",
+                failure_kind=kind,
+                diagnostic=diagnostic,
             ) from None
 
     def wrap(node):
@@ -282,7 +309,9 @@ def _timeline_posts(loader: object, username: str):
             account_id = int(user_id) if user_id and str(user.get("username", "")).casefold() == username else None
             return post, account_id
         except (KeyError, TypeError, ValueError):
-            raise InstagramResponseError("Instagram returned an unsupported post format; the scan was paused.") from None
+            keys = ",".join(sorted(str(key) for key in node.keys() if re.fullmatch(r"[A-Za-z0-9_]{1,80}", str(key))))
+            hint = "unsupported_post_schema" + ("; fields=" + keys[:180] if keys else "")
+            raise InstagramResponseError("Instagram returned an unsupported post format.", diagnostic=hint) from None
 
     return instaloader.NodeIterator(
         context=loader.context,

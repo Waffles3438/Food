@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from foodfinder.database import connect, initialize, link_club_account, upsert_club, utcnow
 from foodfinder.discovery import Club, fetch_myutsu_clubs, fetch_sop_clubs, merge_directory_clubs
-from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events, _extract_dates
+from foodfinder.events import EventCandidate, deduplicate_candidate, extract_events, _extract_dates, _extract_times
 from foodfinder.instagram import MediaSource, _make_loader, collection_error_detail, collection_failure_kind, iter_account_sources
 from foodfinder.retry import retry_plan
 from foodfinder.settings import DISCOVERY_INTERVAL_DAYS, POST_LIMIT, POST_AGE_DAYS
@@ -208,6 +208,9 @@ def _apply_candidate(
         "status": candidate.status,
     }
     values.update({key: value for key, value in overrides.items() if key in FIELD_MAP})
+    # An event date is final: do not let a later source rescan resurface it.
+    if values["event_date"] and values["event_date"] < datetime.now(TORONTO).date().isoformat():
+        values["status"] = "dismissed"
     db.execute(
         """INSERT INTO events(id,source_id,event_key,title,event_date,event_time,location,food,entry_cost,
            restrictions,eligibility,rsvp,food_confidence,review_reason,status,manual_overrides_json,updated_at)
@@ -505,6 +508,54 @@ def event_counts(db_path=None):
             for view in ("upcoming", "today", "review")}
 
 
+def dismiss_expired_events(db_path: Path | str | None = None, *, now: datetime | None = None) -> int:
+    """Dismiss past events, using an explicit end time when the announcement gives one."""
+    current = now or datetime.now(TORONTO)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=TORONTO)
+    current = current.astimezone(TORONTO)
+    cutoff = current.date().isoformat()
+    due: list[str] = []
+    with connect(db_path) as db:
+        rows = db.execute(
+            """SELECT e.id,e.event_date,e.event_time,e.title,s.caption,s.media_text
+               FROM events e JOIN sources s ON s.id=e.source_id
+               WHERE e.event_date!='' AND e.event_date<=?
+                 AND e.status NOT IN ('dismissed','cancelled','duplicate')""",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            try:
+                event_day = date.fromisoformat(row["event_date"])
+            except ValueError:
+                continue
+            if event_day < current.date():
+                due.append(row["id"])
+                continue
+            start = row["event_time"]
+            if not start:
+                continue
+            end = ""
+            for text in (row["title"], row["caption"], row["media_text"]):
+                times = _extract_times(text or "")
+                if start in times:
+                    index = times.index(start)
+                    if index + 1 < len(times):
+                        end = times[index + 1]
+                        break
+            # A start time alone doesn't tell us when the event has finished.
+            if end and end <= current.strftime("%H:%M"):
+                due.append(row["id"])
+        if due:
+            marks = ",".join("?" for _ in due)
+            cursor = db.execute(
+                f"UPDATE events SET status='dismissed', updated_at=? WHERE id IN ({marks})",
+                (utcnow(), *due),
+            )
+            return cursor.rowcount
+        return 0
+
+
 def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None = None) -> dict[str, Any] | None:
     allowed = set(FIELD_MAP)
     unknown = set(patch) - allowed
@@ -526,6 +577,7 @@ def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None
                 f"UPDATE events SET {updates}, manual_overrides_json=?, updated_at=? WHERE id=?",
                 (*[str(value).strip() for value in patch.values()], _json(overrides), utcnow(), event_id),
             )
+    dismiss_expired_events(db_path)
     return get_event(event_id, db_path)
 
 

@@ -21,6 +21,7 @@ from foodfinder.retry import retry_plan
 from foodfinder.scanner import (
     get_event,
     event_counts,
+    dismiss_expired_events,
     launch_scan,
     list_clubs,
     list_events,
@@ -64,6 +65,9 @@ async def _scheduler(app: FastAPI) -> None:
     announced = None
     while True:
         try:
+            count = dismiss_expired_events(app.state.db_path)
+            if count:
+                report(f"Automatically dismissed {count} expired event(s).")
             with connect(app.state.db_path) as db:
                 latest = db.execute("SELECT id,status,finished_at FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
             if latest is None:
@@ -83,7 +87,7 @@ async def _scheduler(app: FastAPI) -> None:
                     launch_scan(app.state.db_path)
         except Exception as exc:
             report(f"Scheduler check failed ({type(exc).__name__}); checking again in one minute.")
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
 
 
 def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = True) -> FastAPI:
@@ -93,6 +97,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
     async def lifespan(app: FastAPI):
         configure_progress_logging()
         initialize(database)
+        dismiss_expired_events(database)
         _recover_orphaned_run(database)
         scheduler_task = None
         if start_scheduler:
