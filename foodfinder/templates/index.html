@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#123e32">
   <title>Free Food Finder · U of T</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260928-compact-filters">
+  <link rel="stylesheet" href="/static/app.css?v=20260930-remove-club">
 </head>
 <body>
   <header class="topbar">
@@ -37,7 +37,7 @@
     <section class="stats" aria-label="Scan summary">
       <article class="stat-card"><span class="stat-icon icon-mint">✳</span><div><strong id="stat-upcoming">—</strong><span>Upcoming food events</span></div></article>
       <article class="stat-card"><span class="stat-icon icon-yellow">◷</span><div><strong id="stat-clubs">—</strong><span>Club accounts found</span></div></article>
-      <article class="stat-card"><span class="stat-icon icon-lilac">✓</span><div><strong id="stat-checked">—</strong><span>Accounts checked</span></div></article>
+      <article class="stat-card"><span class="stat-icon icon-lilac">✓</span><div><strong id="stat-checked">—</strong><span id="stat-checked-label">Total scraped accounts</span></div></article>
     </section>
 
     <section class="content-panel" aria-label="Free food events">
@@ -45,6 +45,13 @@
         <div><p class="eyebrow">WHAT’S HAPPENING</p><h2>Food on the horizon</h2></div>
         <span id="event-count" class="count-pill">0 events</span>
       </div>
+      <div class="event-transfer">
+        <a class="button button-light" id="export-events" href="/api/events/export" download>Export upcoming</a>
+        <button class="button button-outline" id="import-events" type="button">Import events</button>
+        <input id="event-import-file" type="file" accept=".json,application/json" hidden aria-label="Choose an event export">
+        <span class="muted">All upcoming events · JSON file</span>
+      </div>
+      <p id="event-transfer-status" class="footnote" role="status" aria-live="polite" hidden></p>
       <nav class="tabs" aria-label="Event lists">
         <button class="tab active" data-view="upcoming" type="button">Upcoming <span id="tab-upcoming">0</span></button>
         <button class="tab" data-view="today" type="button">Today · time unknown <span id="tab-today">0</span></button>
@@ -63,7 +70,7 @@
 
     <section class="content-panel club-panel" id="clubs-section">
       <div class="panel-heading club-heading">
-        <div><p class="eyebrow">COVERAGE &amp; HEALTH</p><h2>Clubs &amp; scans</h2><p class="panel-subtitle">The directory covers recognised groups; link missing Instagram accounts yourself.</p></div>
+        <div><p class="eyebrow">List of Clubs</p><h2>Clubs &amp; scans</h2><p class="panel-subtitle">The directory covers recognised groups; link missing Instagram accounts yourself.</p></div>
         <div class="button-pair">
           <button id="refresh-clubs" class="button button-light" type="button">↻ Refresh club list</button>
           <button id="add-club" class="button button-outline" type="button">+ Add a club</button>
@@ -75,9 +82,9 @@
         <label><span>CLUB NAME</span><input id="club-name" maxlength="180" required placeholder="e.g. The Baking Club"></label>
         <label><span>INSTAGRAM HANDLE</span><div class="handle-input"><span>@</span><input id="club-username" maxlength="30" placeholder="bakingclubuoft"></div></label>
         <label><span>CLUB WEBSITE (OPTIONAL)</span><input id="club-website" type="url" placeholder="https://example.com"></label>
-        <div class="form-actions"><button class="button button-light" id="cancel-club" type="button">Cancel</button><button class="button button-green" type="submit">Save club</button></div>
+        <div class="form-actions"><button class="button button-danger hidden" id="remove-club" type="button">Remove club</button><button class="button button-light" id="cancel-club" type="button">Cancel</button><button class="button button-green" type="submit">Save club</button></div>
       </form>
-      <div class="club-tools"><label class="search-clubs"><span aria-hidden="true">⌕</span><input id="club-search" type="search" placeholder="Find a club" autocomplete="off"></label><span id="club-directory-count" class="muted"></span></div>
+      <div class="club-tools"><label class="search-clubs"><span aria-hidden="true">⌕</span><input id="club-search" type="search" placeholder="Find a club or @handle" aria-label="Search clubs by name or Instagram handle" autocomplete="off"></label><label class="check-field" title="Handles with valid formatting that have never been successfully checked. Failed attempts remain included."><input id="club-unscraped" type="checkbox"><span>Not scraped yet · valid Instagram handle</span></label><span id="club-directory-count" class="muted"></span></div>
       <div id="clubs" class="club-list"></div>
       <p class="footnote">Instagram access depends on the account and your login session. We mark interrupted checks so you can see where coverage has gaps.</p>
       <p class="footnote">We check captions first and read images when food or event details are missing. Offers shown only in images alongside unrelated captions may be missed.</p>
@@ -86,6 +93,6 @@
     <footer class="footer"><span>Made for students who ask <em>“is there free food?”</em></span><span>All dates in Toronto time · Club posts may change</span></footer>
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/app.js?v=20260928-filter-controls" defer></script>
+  <script src="/static/app.js?v=20260930-remove-club" defer></script>
 </body>
 </html>

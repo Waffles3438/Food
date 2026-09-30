@@ -24,6 +24,77 @@ TIMELINE_DOC_ID = "7898261790222653"
 class InstagramResponseError(RuntimeError):
     """Instagram returned an incompatible or unavailable timeline, not an empty feed."""
 
+    def __init__(self, message: str, *, failure_kind: str = "response", diagnostic: str = ""):
+        super().__init__(message)
+        self.failure_kind = failure_kind
+        self.diagnostic = diagnostic
+
+
+def _timeline_response_diagnostic(response: object) -> tuple[str, str]:
+    """Classify error signals while keeping raw responses out of saved diagnostics."""
+    def signals(value: object, depth: int = 0) -> Iterator[str]:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            if value.get("require_login") is True:
+                yield "login_required"
+            if value.get("checkpoint_url"):
+                yield "checkpoint_required"
+            for key in ("message", "error", "error_message", "error_type", "status",
+                        "error_user_title", "error_user_msg", "error_description",
+                        "code", "error_code", "api_error_code", "error_subcode", "type", "errors", "extensions"):
+                if key in value:
+                    yield from signals(value[key], depth + 1)
+        elif isinstance(value, list):
+            for item in value[:20]:
+                yield from signals(item, depth + 1)
+        elif isinstance(value, (str, int)) and not isinstance(value, bool):
+            yield str(value)
+
+    signal_text = " ".join(signals(response)).casefold()
+    kind = collection_failure_kind(RuntimeError(signal_text)) or "response"
+    reason = "unspecified"
+    if re.search(r"rate[ _-]?limit|too many (?:requests|queries)|temporarily blocked", signal_text):
+        reason = "request_limit"
+        if kind == "response":
+            kind = "temporary_limit"
+    elif re.search(r"invalid session|session expired|not authenticated|not logged in|login required", signal_text):
+        reason = "login_required"
+        if kind == "response":
+            kind = "authentication"
+    elif re.search(r"undefined variable|variable.*(?:required|missing|not provided|not defined)|unknown (?:query|document)|invalid (?:query|document)|persistedquerynotfound", signal_text):
+        reason = "query_rejected"
+    elif re.search(r"user not found|account not found|user does not exist|account does not exist|private account", signal_text):
+        reason = "account_unavailable"
+    elif re.search(r"internal server error|unexpected server error|something went wrong", signal_text):
+        reason = "server_error"
+
+    def error_codes(value: object, depth: int = 0) -> Iterator[str]:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            for key in ("code", "error_code", "api_error_code", "error_subcode"):
+                code = value.get(key)
+                if isinstance(code, (str, int)) and not isinstance(code, bool) and re.fullmatch(r"\d{1,8}", str(code)):
+                    yield str(code)
+            for key in ("errors", "error", "extensions"):
+                if key in value:
+                    yield from error_codes(value[key], depth + 1)
+        elif isinstance(value, list):
+            for item in value[:20]:
+                yield from error_codes(item, depth + 1)
+
+    codes = ",".join(sorted(set(error_codes(response)))[:4]) or "none"
+    if isinstance(response, dict):
+        data = response.get("data")
+        data_shape = "missing" if "data" not in response else "null" if data is None else type(data).__name__
+        errors = response.get("errors")
+        error_count = len(errors) if isinstance(errors, list) else int(bool(errors))
+        diagnostic = f"timeline_response; data={data_shape}; errors={error_count}; category={kind}"
+    else:
+        diagnostic = f"timeline_response; body={type(response).__name__}; category={kind}"
+    return kind, f"{diagnostic}; codes={codes}; reason={reason}"
+
 
 def collection_failure_kind(exc: BaseException) -> str:
     """Classify access failures without exposing response bodies or session information."""
@@ -379,7 +450,7 @@ def iter_account_sources(
     include_stories: bool = True,
     saved_sources: dict[str, dict] | None = None,
 ) -> Iterator[MediaSource]:
-    """Yield bounded recent posts and accessible Stories for one public club account."""
+    """Yield new or incomplete recent posts and Stories; skip completed source IDs."""
     try:
         import instaloader
     except ImportError as exc:
@@ -404,6 +475,10 @@ def iter_account_sources(
         for post, owner_id in islice(posts, limit):
             account_id = account_id or owner_id
             posts_seen += 1
+            cached = saved_sources.get(f"post:{post.shortcode}", {})
+            if cached.get("cache_version") == 1:
+                report(f"@{username}: post {post.shortcode} already scraped; skipped.")
+                continue
             post_date = post.date_utc
             if post_date.tzinfo is None:
                 post_date = post_date.replace(tzinfo=timezone.utc)
@@ -415,34 +490,25 @@ def iter_account_sources(
             images: list[str] = []
             warning = ""
             caption = (post.caption or "").strip()
-            cached = saved_sources.get(f"post:{post.shortcode}", {})
-            if cached.get("cache_version") == 1 and cached.get("caption") == caption:
-                report(f"@{username}: post {post.shortcode} unchanged; skipping saved post.")
-                continue
             media_text = ""
             ocr_complete = False
             if caption_needs_ocr(caption, posted_at=post_date):
-                if cached.get("cache_version") == 1 and cached.get("ocr_complete"):
-                    media_text = cached["media_text"]
-                    ocr_complete = True
-                    report(f"@{username}: caption edited for {post.shortcode}; reusing saved image text.")
-                else:
-                    report(f"@{username}: post {post.shortcode} needs image text; downloading artwork.")
-                    try:
-                        images = _download_post_images(loader, post, scratch)
-                        if not images:
-                            warning = "Post images could not be read; only the caption was checked."
-                    except Exception as exc:
-                        if collection_failure_kind(exc):
-                            raise
-                        images = []
+                report(f"@{username}: post {post.shortcode} needs image text; downloading artwork.")
+                try:
+                    images = _download_post_images(loader, post, scratch)
+                    if not images:
                         warning = "Post images could not be read; only the caption was checked."
-                    try:
-                        media_text = ocr_images(images)
-                        ocr_complete = not warning
-                    except OCRUnavailableError as exc:
-                        media_text = exc.partial_text
-                        warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
+                except Exception as exc:
+                    if collection_failure_kind(exc):
+                        raise
+                    images = []
+                    warning = "Post images could not be read; only the caption was checked."
+                try:
+                    media_text = ocr_images(images)
+                    ocr_complete = not warning
+                except OCRUnavailableError as exc:
+                    media_text = exc.partial_text
+                    warning = "Poster OCR was incomplete; the caption and any readable poster text were kept. Check the local OCR models."
             else:
                 report(f"@{username}: post {post.shortcode} checked from caption; image OCR skipped.")
             yield MediaSource(
@@ -474,7 +540,7 @@ def iter_account_sources(
             for item in story.get_items():
                 stable_item_id = str(getattr(item, "mediaid", None) or getattr(item, "id", None) or "")
                 cached = saved_sources.get(f"story:{stable_item_id}", {}) if stable_item_id else {}
-                if cached.get("cache_version") == 1 and cached.get("caption") == (getattr(item, "caption", None) or "").strip():
+                if cached.get("cache_version") == 1:
                     report(f"@{username}: Story {stable_item_id} already processed; skipping saved Story.")
                     continue
                 report(f"@{username}: downloading Story media.")

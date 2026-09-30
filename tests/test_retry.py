@@ -33,7 +33,7 @@ class RetryTests(unittest.TestCase):
                        (str(self.count), status, ended.isoformat(), ended.isoformat(), kind, message))
         return ended
 
-    def test_repeated_failures_always_wait_five_minutes_across_rereads(self):
+    def test_repeated_failures_always_wait_one_minute_across_rereads(self):
         for delay in (1, 1, 1, 1, 1):
             ended = self.add("connection")
             plan = retry_plan(self.path, now=ended)
@@ -45,19 +45,19 @@ class RetryTests(unittest.TestCase):
         ended = self.add("response")
         self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=1))
 
-    def test_only_http_429_waits_six_hours(self):
+    def test_restrictions_have_longer_cooldowns(self):
         for kind in ("rate_limit", "temporary_limit", "access", "interrupted"):
             ended = self.add(kind)
-            self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=360 if kind == "rate_limit" else 5))
+            self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=360 if kind == "rate_limit" else 30 if kind == "temporary_limit" else 1))
 
     def test_authentication_retries_with_login_hint_and_running_scan_has_no_retry(self):
         ended = self.add("authentication")
         self.assertTrue(retry_plan(self.path)["requires_login"])
-        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=1))
+        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(hours=6))
         self.add("", status="running")
         self.assertEqual(retry_plan(self.path)["next_scan_at"], "")
 
-    def test_uncategorized_failures_retry_after_five_minutes(self):
+    def test_uncategorized_failures_retry_after_one_minute(self):
         for status in ("partial", "error"):
             ended = self.add("", status=status)
             plan = retry_plan(self.path, now=ended)
@@ -74,6 +74,18 @@ class RetryTests(unittest.TestCase):
                 self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(hours=6))
                 self.assertTrue(retry_plan(self.path, now=ended + timedelta(hours=5))["cooldown"])
                 self.assertFalse(retry_plan(self.path, now=ended + timedelta(hours=6))["cooldown"])
+
+    def test_restriction_backoff_persists_and_resets_after_success(self):
+        for delay in (30, 60, 120, 240, 360, 360, 360):
+            ended = self.add("temporary_limit")
+            plan = retry_plan(self.path, now=ended)
+            self.assertEqual(datetime.fromisoformat(plan["next_scan_at"]), ended + timedelta(minutes=delay))
+            self.assertEqual(retry_plan(self.path, now=ended), plan)
+            self.assertTrue(plan["cooldown"])
+            self.assertFalse(retry_plan(self.path, now=ended + timedelta(minutes=delay))["cooldown"])
+        self.add("", status="complete")
+        ended = self.add("temporary_limit")
+        self.assertEqual(datetime.fromisoformat(retry_plan(self.path)["next_scan_at"]), ended + timedelta(minutes=30))
 
     def test_safe_error_details_do_not_include_raw_response_or_session(self):
         error = RuntimeError("403 Forbidden response contains sessionid=private-cookie")
@@ -92,11 +104,38 @@ class RetryTests(unittest.TestCase):
 
 
 class AutomaticRetryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_scheduler_retries_authentication_after_five_minutes(self):
+    async def test_startup_override_skips_cooldown_only_once(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "test.sqlite3"
             initialize(path)
-            finished = (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+            finished = datetime.now(timezone.utc).isoformat()
+            with connect(path) as db:
+                db.execute("INSERT INTO scan_runs(id,kind,status,started_at,finished_at,failure_kind) VALUES ('failed','instagram','partial',?,?,'rate_limit')", (finished, finished))
+            app = SimpleNamespace(state=SimpleNamespace(db_path=str(path)))
+            # Leave the restriction in place to model an immediate restricted response.
+            with patch("foodfinder.web.launch_scan") as launch, patch("foodfinder.web.asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
+                with self.assertRaises(asyncio.CancelledError):
+                    await _scheduler(app, ignore_cooldown_once=True)
+            launch.assert_called_once_with(str(path))
+            self.assertTrue(retry_plan(path)["cooldown"])
+
+    async def test_startup_override_does_not_launch_over_running_scan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.sqlite3"
+            initialize(path)
+            with connect(path) as db:
+                db.execute("INSERT INTO scan_runs(id,kind,status,started_at) VALUES ('active','instagram','running',?)", (datetime.now(timezone.utc).isoformat(),))
+            app = SimpleNamespace(state=SimpleNamespace(db_path=str(path)))
+            with patch("foodfinder.web.launch_scan") as launch, patch("foodfinder.web.asyncio.sleep", side_effect=asyncio.CancelledError):
+                with self.assertRaises(asyncio.CancelledError):
+                    await _scheduler(app, ignore_cooldown_once=True)
+            launch.assert_not_called()
+
+    async def test_scheduler_retries_authentication_after_six_hours(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test.sqlite3"
+            initialize(path)
+            finished = (datetime.now(timezone.utc) - timedelta(hours=7)).isoformat()
             with connect(path) as db:
                 db.execute("INSERT INTO scan_runs(id,kind,status,started_at,finished_at,failure_kind) VALUES ('failed','instagram','partial',?,?,'authentication')", (finished, finished))
             app = SimpleNamespace(state=SimpleNamespace(db_path=str(path)))
@@ -119,7 +158,7 @@ class AutomaticRetryTests(unittest.IsolatedAsyncioTestCase):
             launch.assert_called_once_with(str(path))
 
     async def test_scheduler_does_not_retry_before_failure_cooldown(self):
-        for kind, age in (("response", 1), ("authentication", 0.5), ("rate_limit", 6)):
+        for kind, age in (("response", 0.5), ("authentication", 60), ("rate_limit", 6), ("temporary_limit", 20)):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder) / "test.sqlite3"
                 initialize(path)

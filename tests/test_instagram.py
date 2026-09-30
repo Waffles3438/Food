@@ -14,7 +14,7 @@ from fixed_clock import EventFixtureDateTime
 
 from foodfinder.instagram import (
     InstagramResponseError, TIMELINE_DOC_ID, _download_post_images, _make_loader,
-    collection_failure_kind, iter_account_sources,
+    collection_error_detail, collection_failure_kind, iter_account_sources,
     verify_session, interactive_login,
 )
 from foodfinder.events import OCRUnavailableError, ocr_images
@@ -97,16 +97,14 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual([source.source_key for source in sources], ["post:new"])
         self.download.assert_called_once()
 
-    def test_edited_caption_reuses_successful_ocr(self):
+    def test_completed_post_with_edited_caption_is_not_scraped_again(self):
         cached = {"post:fixture": {"caption": "Free cookies tomorrow!", "cache_version": 1,
                                    "media_text": "Student Centre, 6 PM", "ocr_complete": 1}}
         with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])), patch(
             "foodfinder.instagram.ocr_images"
         ) as ocr:
-            source = self.sources(saved_sources=cached, include_stories=False)[0]
-        self.assertEqual(source.caption, "Free pizza tomorrow!")
-        self.assertEqual(source.media_text, "Student Centre, 6 PM")
-        self.assertTrue(source.ocr_complete)
+            sources = self.sources(saved_sources=cached, include_stories=False)
+        self.assertEqual(sources, [])
         self.download.assert_not_called()
         ocr.assert_not_called()
 
@@ -119,6 +117,48 @@ class TimelineTests(unittest.TestCase):
             self.assertEqual(len(sources), 1)
             self.download.assert_called_once()
 
+    def test_cached_post_does_not_read_caption_and_keeps_story_account_id(self):
+        class SavedPost:
+            shortcode = "fixture"
+
+            @property
+            def caption(self):
+                raise AssertionError("Completed posts must be skipped before reading captions")
+
+        with patch("foodfinder.instagram._timeline_posts", return_value=iter([(SavedPost(), 42)])):
+            self.assertEqual(self.sources(saved_sources={"post:fixture": {"cache_version": 1}}), [])
+        self.stories.assert_called_once_with(userids=[42])
+        self.download.assert_not_called()
+
+    def test_saved_post_history_survives_restart_and_new_posts_are_collected(self):
+        from foodfinder.database import connect, initialize
+        from foodfinder.scanner import run_scan, upsert_manual_club
+
+        original = media()
+        original["caption"]["text"] = "Free cookies! September 27, 2026 at 6 PM.\nLocation: Student Centre"
+        edited = media()
+        edited["caption"]["text"] = "A different caption on the same post."
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "posts.sqlite3"
+            initialize(path)
+            upsert_manual_club(name="Fixture Club", username="club", db_path=path)
+            with patch("foodfinder.scanner.due_for_discovery", return_value=False), patch(
+                "foodfinder.scanner._make_loader", return_value=(self.loader, "fixtureuser")
+            ), patch("foodfinder.events.datetime", EventFixtureDateTime), patch(
+                "foodfinder.scanner.datetime", EventFixtureDateTime
+            ), patch.object(self.loader.context, "doc_id_graphql_query", side_effect=[
+                page([original]), page([edited, media("new")])
+            ]):
+                run_scan(path)
+                initialize(path)
+                second = run_scan(path)
+            with connect(path) as db:
+                saved = db.execute("SELECT source_key,caption FROM sources ORDER BY source_key").fetchall()
+                self.assertEqual([row["source_key"] for row in saved], ["post:fixture", "post:new"])
+                self.assertEqual(saved[0]["caption"], original["caption"]["text"])
+                self.assertEqual(db.execute("SELECT posts_seen FROM scan_runs WHERE id=?", (second,)).fetchone()[0], 1)
+            self.download.assert_called_once()
+
     def test_empty_media_download_is_not_marked_successful_for_caching(self):
         self.download.return_value = []
         with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])):
@@ -126,12 +166,13 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(source.collection_warning)
         self.assertFalse(source.ocr_complete)
 
-    def test_caption_edit_that_newly_needs_ocr_downloads_images(self):
+    def test_caption_edit_does_not_download_a_completed_caption_only_post(self):
         cached = {"post:fixture": {"caption": "Meet the team!", "cache_version": 1,
                                    "media_text": "", "ocr_complete": 0}}
         with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])):
-            self.sources(saved_sources=cached, include_stories=False)
-        self.download.assert_called_once()
+            sources = self.sources(saved_sources=cached, include_stories=False)
+        self.assertEqual(sources, [])
+        self.download.assert_not_called()
 
     def test_successfully_cached_story_skips_download(self):
         item = SimpleNamespace(mediaid=123, caption="")
@@ -142,6 +183,17 @@ class TimelineTests(unittest.TestCase):
         ) as download_story:
             sources = self.sources(saved_sources=cached)
         self.assertEqual([source.kind for source in sources], ["post"])
+        download_story.assert_not_called()
+
+    def test_cached_story_with_edited_caption_is_skipped(self):
+        item = SimpleNamespace(mediaid=123, caption="An updated caption")
+        self.stories.return_value = [SimpleNamespace(get_items=lambda: iter([item]))]
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=page([media()])), patch.object(
+            self.loader, "download_storyitem"
+        ) as download_story:
+            sources = self.sources(saved_sources={"post:fixture": {"cache_version": 1},
+                                                  "story:123": {"caption": "", "cache_version": 1}})
+        self.assertEqual(sources, [])
         download_story.assert_not_called()
 
     def test_one_post_uses_authenticated_timeline_without_profile_or_stories(self):
@@ -194,6 +246,66 @@ class TimelineTests(unittest.TestCase):
                 with self.assertRaises(InstagramResponseError):
                     self.sources()
                 query.assert_called_once()
+        self.stories.assert_not_called()
+
+    def test_timeline_error_classification_preserves_restrictions_without_raw_data(self):
+        for response, kind in (
+            ({"message": "Please wait a few minutes; sessionid=private-cookie", "status": "fail"}, "temporary_limit"),
+            ({"errors": [{"message": "feedback_required", "extensions": {"code": 401}}]}, "temporary_limit"),
+            ({"errors": [{"message": "Rate limited", "extensions": {"code": 429}}]}, "rate_limit"),
+            ({"errors": [{"message": "challenge_required"}]}, "authentication"),
+            ({"require_login": True}, "authentication"),
+            ({"message": "403 Forbidden"}, "access"),
+            ({"data": None, "sessionid": "private-cookie"}, "response"),
+        ):
+            with self.subTest(kind=kind, response=response), patch.object(
+                self.loader.context, "doc_id_graphql_query", return_value=response
+            ) as query:
+                with self.assertRaises(InstagramResponseError) as caught:
+                    self.sources()
+                self.assertEqual(collection_failure_kind(caught.exception), kind)
+                detail = collection_error_detail(caught.exception)
+                self.assertIn(f"category={kind}", detail)
+                self.assertNotIn("private-cookie", detail)
+                self.assertNotIn("sessionid", detail)
+                query.assert_called_once()
+        self.stories.assert_not_called()
+
+    def test_readable_timeline_with_unrelated_partial_errors_still_yields_posts(self):
+        response = page([media()])
+        response["errors"] = [{"message": "Optional field unavailable"}]
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=response):
+            self.assertEqual(self.sources(include_stories=False)[0].source_key, "post:fixture")
+
+    def test_graphql_error_code_and_safe_reason_are_visible(self):
+        for message, code, reason, kind in (
+            ("Rate limit exceeded; sessionid=private-cookie", 1234567, "request_limit", "temporary_limit"),
+            ("Variable example was not provided; private-cookie", 7654321, "query_rejected", "response"),
+            ("Invalid session: private-cookie", 1234, "login_required", "authentication"),
+            ("Something went wrong: private-cookie", 5678, "server_error", "response"),
+            ("Unrecognized message: private-cookie", 9876, "unspecified", "response"),
+        ):
+            response = {"data": None, "errors": [{"message": message, "code": code}]}
+            with self.subTest(reason=reason), patch.object(
+                self.loader.context, "doc_id_graphql_query", return_value=response
+            ):
+                with self.assertRaises(InstagramResponseError) as caught:
+                    self.sources()
+                self.assertEqual(collection_failure_kind(caught.exception), kind)
+                detail = collection_error_detail(caught.exception)
+                self.assertIn(f"codes={code}", detail)
+                self.assertIn(f"reason={reason}", detail)
+                self.assertNotIn("private-cookie", detail)
+                self.assertNotIn("sessionid", detail)
+
+    def test_readable_timeline_with_access_restriction_stops(self):
+        response = page([media()])
+        response["errors"] = [{"message": "feedback_required"}]
+        with patch.object(self.loader.context, "doc_id_graphql_query", return_value=response):
+            with self.assertRaises(InstagramResponseError) as caught:
+                self.sources()
+        self.assertEqual(collection_failure_kind(caught.exception), "temporary_limit")
+        self.download.assert_not_called()
         self.stories.assert_not_called()
 
     def test_old_pinned_post_does_not_hide_recent_post(self):

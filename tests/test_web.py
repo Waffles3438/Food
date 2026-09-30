@@ -73,6 +73,29 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(corrected.status_code, 200)
         self.assertEqual(corrected.json()["location"], "Sidney Smith Hall")
 
+    def test_removed_club_stays_removed_and_preserves_events(self):
+        before = self.client.get("/api/events").json()
+        response = self.client.delete(f"/api/clubs/{self.club_id}")
+        self.assertEqual(response.status_code, 204)
+        initialize(self.db_path)
+        with connect(self.db_path) as db:
+            ident = upsert_club(db, source_key="manual:fixture", name="Test Food Club", username="testfoodclub")
+            self.assertEqual(ident, self.club_id)
+            self.assertEqual(db.execute("SELECT enabled FROM accounts WHERE id=?", (self.account_id,)).fetchone()[0], 0)
+        self.assertEqual(self.client.get("/api/clubs").json(), [])
+        self.assertEqual(self.client.get("/api/events").json(), before)
+        self.assertEqual(self.client.patch(f"/api/clubs/{self.club_id}", json={"active": True}).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/clubs/{self.club_id}").status_code, 404)
+        self.assertEqual(self.client.delete("/api/clubs/not-a-club").status_code, 404)
+
+    def test_removing_club_keeps_shared_account_enabled(self):
+        with connect(self.db_path) as db:
+            other = upsert_club(db, source_key="manual:shared", name="Shared Food Club", username="testfoodclub")
+        self.assertEqual(self.client.delete(f"/api/clubs/{self.club_id}").status_code, 204)
+        self.assertEqual([club["id"] for club in self.client.get("/api/clubs").json()], [other])
+        with connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT enabled FROM accounts WHERE id=?", (self.account_id,)).fetchone()[0], 1)
+
     def test_counts_match_lists_and_change_after_dismissal(self):
         counts = self.client.get("/api/event-counts").json()
         for view in ("upcoming", "review", "today"):

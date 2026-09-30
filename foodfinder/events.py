@@ -261,8 +261,11 @@ def _valid_food_claim(text: str) -> re.Match[str] | None:
 
 def _extract_times(text: str) -> list[str]:
     period = r"(?:a\.?m\.?|p\.?m\.?)"
+    # Story video countdowns are commonly OCR'd as isolated 0:55 / 0:28 lines.
+    # Keep explicit midnight (00:55 or 12:55am) and times in sentences.
+    text = re.sub(r"(?m)^[ \t]*0:[0-5]\d[ \t]*$", "", text)
     # Posters and OCR often use a dot instead of a colon in 24-hour times.
-    text = re.sub(r"(?<![\w.$])([01]\d|2[0-3])\.([0-5]\d)(?![\w.])",
+    text = re.sub(r"(?<![\w.$])([01]?\d|2[0-3])\.([0-5]\d)(?![\w.])",
                   r"\1:\2", text)
     text = re.sub(r"\b(\d{1,2})[.]([0-5]\d)\s*(a\.?m\.?|p\.?m\.?)\b",
                   r"\1:\2\3", text, flags=re.I)
@@ -273,10 +276,22 @@ def _extract_times(text: str) -> list[str]:
         return f"{start}{suffix}-{end}{suffix}"
 
     text = re.sub(
-        rf"\b(\d{{1,2}}(?::\d{{2}})?)\s*[-–]\s*(\d{{1,2}}(?::\d{{2}})?)\s*({period})\b",
+        rf"\b(\d{{1,2}}(?::\d{{2}})?)\s*(?:[-–—]|to)\s*(\d{{1,2}}(?::\d{{2}})?)\s*({period})\b",
         normalize_time_range,
         text,
         flags=re.I,
+    )
+    def expand_unmarked_range(match):
+        start, end = match.groups()
+        # Require minutes somewhere so dates and numeric quantities aren't times.
+        if ":" not in start + end:
+            return match.group()
+        return f"{start if ':' in start else start + ':00'}-{end if ':' in end else end + ':00'}"
+
+    text = re.sub(
+        r"(?<![\w:./$])((?:[01]?\d|2[0-3])(?::[0-5]\d)?)\s*(?:[-–—]|to)\s*"
+        r"((?:[01]?\d|2[0-3])(?::[0-5]\d)?)(?![\w:./])",
+        expand_unmarked_range, text, flags=re.I,
     )
     found: list[str] = []
     for m in TIME_PATTERN.finditer(text):
@@ -289,6 +304,8 @@ def _extract_times(text: str) -> list[str]:
             hour = hour % 12 + (12 if period.startswith("p") else 0)
         else:
             hour, minute = int(m.group(4)), int(m.group(5))
+            if 1 <= hour < 9:
+                hour += 12
         value = f"{hour:02d}:{minute:02d}"
         if value not in found:
             found.append(value)

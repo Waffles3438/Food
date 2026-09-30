@@ -41,6 +41,20 @@ class DateRegressionTests(unittest.TestCase):
         self.assertEqual(str(_extract_dates('September 17, 2025', self.posted, self.now)[0][0]), '2025-09-17')
         self.assertEqual(_extract_times('5.30pm'), ['17:30'])
 
+    def test_story_countdown_does_not_replace_event_range(self):
+        self.assertEqual(_extract_times('tomorrow\n0:55\nFree food\nSept 29\n6-9pm\n0:28'), ['18:00', '21:00'])
+
+    def test_unmarked_early_hours_default_to_pm(self):
+        for text in ('5:00-6:30', '5 to 6:30', '5.00 TO 6.30'):
+            with self.subTest(text=text):
+                self.assertEqual(_extract_times(text), ['17:00', '18:30'])
+        self.assertEqual(_extract_times('8:59'), ['20:59'])
+        self.assertEqual(_extract_times('9:00'), ['09:00'])
+        self.assertEqual(_extract_times('5am to 6:30am'), ['05:00', '06:30'])
+        self.assertEqual(_extract_times('00:55'), ['00:55'])
+        self.assertEqual(_extract_times('12:55am'), ['00:55'])
+        self.assertEqual(_extract_times('17:00'), ['17:00'])
+
     def test_day_first_poster_date_and_dotted_24_hour_start(self):
         for date_text in ('30.SEP2026', '30.SEP.2026', '30 September 2026'):
             with self.subTest(date_text=date_text):

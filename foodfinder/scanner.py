@@ -334,20 +334,38 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                     )
 
         with connect(db_path) as db:
+            scan_pass = int(db.execute("SELECT value FROM kv WHERE key='instagram_scan_pass'").fetchone()["value"])
             accounts = db.execute(
                 """SELECT a.* FROM accounts a WHERE a.enabled=1
                    AND EXISTS (SELECT 1 FROM club_accounts ca JOIN clubs c ON c.id=ca.club_id
-                               WHERE ca.account_id=a.id AND c.active=1)
-                   ORDER BY a.last_checked, a.username"""
+                               WHERE ca.account_id=a.id AND c.active=1 AND c.removed=0)
+                   ORDER BY a.ever_checked, a.last_checked, a.username"""
             ).fetchall()
+            remaining = [account for account in accounts if account["last_scan_pass"] < scan_pass]
+            if accounts and not remaining:
+                scan_pass += 1
+                db.execute("UPDATE kv SET value=? WHERE key='instagram_scan_pass'", (str(scan_pass),))
+                remaining = accounts
+            accounts = remaining
             db.execute("UPDATE scan_runs SET accounts_total=?, message=? WHERE id=?",
                        (len(accounts), "Preparing Instagram scan", run_id))
 
         loader = None
         loader_error: Exception | None = None
-        report(f"Instagram queue: {len(accounts)} accounts. Checking captions first; images use OCR when needed.")
+        report(f"Instagram pass {scan_pass}: {len(accounts)} accounts remaining. Checking captions first; images use OCR when needed.")
         for index, account in enumerate(accounts, 1):
             account_id, username = str(account["id"]), str(account["username"])
+            with connect(db_path) as db:
+                # A club may be removed or paused after this pass was queued.
+                eligible = db.execute(
+                    """SELECT 1 FROM accounts a WHERE a.id=? AND a.enabled=1
+                       AND EXISTS (SELECT 1 FROM club_accounts ca JOIN clubs c ON c.id=ca.club_id
+                                   WHERE ca.account_id=a.id AND c.active=1 AND c.removed=0)""",
+                    (account_id,),
+                ).fetchone()
+                if not eligible:
+                    db.execute("UPDATE scan_runs SET accounts_total=accounts_total-1 WHERE id=?", (run_id,))
+                    continue
             report(f"Account {index}/{len(accounts)}: @{username} - starting.")
             with connect(db_path) as db:
                 db.execute("UPDATE scan_runs SET message=? WHERE id=?", (f"Checking @{username}", run_id))
@@ -415,9 +433,13 @@ def run_scan(db_path: Path | str | None = None, *, force_discovery: bool = False
                 account_status = "error"
                 checked = 0
             with connect(db_path) as db:
+                if loader_error is None:
+                    # An attempted account finishes its turn even if it fails.
+                    # Login setup failures have not made an account request.
+                    db.execute("UPDATE accounts SET last_scan_pass=? WHERE id=?", (scan_pass, account_id))
                 db.execute(
-                    "UPDATE accounts SET last_checked=?,status=?,status_message=?,posts_found=?,updated_at=? WHERE id=?",
-                    (utcnow(), account_status, message, checked, utcnow(), account_id),
+                    "UPDATE accounts SET ever_checked=CASE WHEN ? IN ('ok','partial') THEN 1 ELSE ever_checked END, last_checked=?,status=?,status_message=?,posts_found=?,updated_at=? WHERE id=?",
+                    (account_status, utcnow(), account_status, message, checked, utcnow(), account_id),
                 )
                 db.execute(
                     "UPDATE clubs SET last_checked=?,check_status=?,check_message=? WHERE id IN "
@@ -680,7 +702,7 @@ def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None
         raise ValueError("status must be upcoming, cancelled, or dismissed.")
     with connect(db_path) as db:
         row = db.execute(
-            """SELECT e.id,e.title,e.event_date,e.event_time,e.manual_overrides_json,a.username
+            """SELECT e.id,e.title,e.event_date,e.event_time,e.status,e.manual_overrides_json,a.username
                FROM events e JOIN sources s ON s.id=e.source_id
                JOIN accounts a ON a.id=s.account_id WHERE e.id=?""",
             (event_id,),
@@ -688,11 +710,14 @@ def patch_event(event_id: str, patch: dict[str, Any], db_path: Path | str | None
         if not row:
             return None
         related = [row]
+        restore_group = row["status"] == "dismissed" and patch.get("status") == "upcoming"
         candidates = db.execute(
             """SELECT e.id,e.title,e.event_date,e.event_time,e.manual_overrides_json,a.username FROM events e
                JOIN sources s ON s.id=e.source_id
                JOIN accounts a ON a.id=s.account_id
-               WHERE e.status NOT IN ('cancelled','dismissed','duplicate')""",
+               WHERE e.status NOT IN ('cancelled','duplicate')
+                 AND (? OR e.status!='dismissed')""",
+            (int(restore_group),),
         ).fetchall()
         for group in _event_groups([dict(item) for item in candidates]):
             if any(item["id"] == event_id for item in group):
@@ -789,9 +814,12 @@ def list_clubs(db_path: Path | str | None = None) -> list[dict[str, Any]]:
     with connect(db_path) as db:
         rows = db.execute(
             """SELECT c.*, GROUP_CONCAT(DISTINCT a.username) AS accounts,
-               GROUP_CONCAT(DISTINCT a.status) AS account_statuses
+               GROUP_CONCAT(DISTINCT a.status) AS account_statuses,
+               COALESCE(primary_account.ever_checked, 0) AS instagram_ever_checked
                FROM clubs c LEFT JOIN club_accounts ca ON ca.club_id=c.id
-               LEFT JOIN accounts a ON a.id=ca.account_id GROUP BY c.id ORDER BY c.name COLLATE NOCASE"""
+               LEFT JOIN accounts a ON a.id=ca.account_id
+               LEFT JOIN accounts primary_account ON primary_account.username=c.instagram_username COLLATE NOCASE
+               WHERE c.removed=0 GROUP BY c.id ORDER BY c.name COLLATE NOCASE"""
         ).fetchall()
     return [{**dict(row), "sources": json.loads(row["sources_json"] or "[]")} for row in rows]
 
@@ -813,7 +841,7 @@ def upsert_manual_club(
         raise ValueError("Enter an Instagram username without the @ sign.")
     with connect(db_path) as db:
         if club_id:
-            current = db.execute("SELECT * FROM clubs WHERE id=?", (club_id,)).fetchone()
+            current = db.execute("SELECT * FROM clubs WHERE id=? AND removed=0", (club_id,)).fetchone()
             if not current:
                 raise KeyError(club_id)
             db.execute("DELETE FROM club_accounts WHERE club_id=?", (club_id,))
@@ -838,6 +866,22 @@ def upsert_manual_club(
     return next(club for club in list_clubs(db_path) if club["id"] == ident)
 
 
+def remove_club(club_id: str, db_path: Path | str | None = None) -> None:
+    with connect(db_path) as db:
+        changed = db.execute("UPDATE clubs SET removed=1, active=0 WHERE id=? AND removed=0", (club_id,))
+        if not changed.rowcount:
+            raise KeyError(club_id)
+        # Shared handles remain available to their other clubs; saved events
+        # and evidence are retained even when the last club is removed.
+        db.execute(
+            """UPDATE accounts SET enabled=0 WHERE id IN
+               (SELECT account_id FROM club_accounts WHERE club_id=?)
+               AND NOT EXISTS (SELECT 1 FROM club_accounts ca JOIN clubs c ON c.id=ca.club_id
+                               WHERE ca.account_id=accounts.id AND c.removed=0)""",
+            (club_id,),
+        )
+
+
 def scan_progress(db_path: Path | str | None = None) -> dict[str, Any]:
     with connect(db_path) as db:
         run = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC LIMIT 1").fetchone()
@@ -847,10 +891,12 @@ def scan_progress(db_path: Path | str | None = None) -> dict[str, Any]:
         missing = db.execute(
             "SELECT COUNT(*) AS n FROM clubs WHERE active=1 AND instagram_username=''"
         ).fetchone()["n"]
+        checked = db.execute("SELECT COUNT(*) FROM accounts WHERE enabled=1 AND ever_checked=1").fetchone()[0]
     return {
         "run": dict(run) if run else None,
         "retry": retry_plan(db_path),
         "accounts": {row["status"]: row["count"] for row in statuses},
+        "accounts_checked": checked,
         "missing_handles": missing,
         "running": bool(run and run["status"] == "running"),
     }

@@ -2,7 +2,7 @@
   const $ = (selector, parent = document) => parent.querySelector(selector);
   const $$ = (selector, parent = document) => [...parent.querySelectorAll(selector)];
   const CLUB_PAGE_SIZE = 40;
-  const state = { view: "upcoming", clubs: [], clubRows: [], clubMatches: [], clubPage: 0, refreshTimer: null, toastTimer: null, clubFilter: "", clubRefreshRun: "" };
+  const state = { view: "upcoming", clubs: [], clubRows: [], clubMatches: [], clubPage: 0, refreshTimer: null, toastTimer: null, clubFilter: "", clubRefreshRun: "", statusLoading: false };
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -28,12 +28,45 @@
     return node("span", `badge ${style}`.trim(), label);
   }
 
+  function hideToast() {
+    const toast = $("#toast");
+    toast.classList.remove("visible");
+    toast.style.pointerEvents = "none";
+    toast.style.visibility = "hidden";
+    toast.inert = true;
+  }
+
   function showToast(message) {
     const toast = $("#toast");
-    toast.textContent = message;
+    toast.replaceChildren(document.createTextNode(message));
     toast.classList.add("visible");
+    toast.style.pointerEvents = "auto";
+    toast.style.visibility = "visible";
+    toast.inert = false;
     clearTimeout(state.toastTimer);
-    state.toastTimer = setTimeout(() => toast.classList.remove("visible"), 2800);
+    state.toastTimer = setTimeout(hideToast, 2800);
+  }
+
+  function showUndoToast(message, onUndo) {
+    const toast = $("#toast");
+    const undo = node("button", "toast-undo", "Undo");
+    undo.type = "button";
+    undo.addEventListener("click", async () => {
+      if (undo.disabled) return;
+      undo.disabled = true;
+      undo.textContent = "Undoing…";
+      clearTimeout(state.toastTimer);
+      try { await onUndo(); }
+      catch (error) { showToast(error.message); }
+    });
+    toast.replaceChildren(document.createTextNode(message), undo);
+    toast.classList.add("visible");
+    // Also work when a browser still has the old, non-interactive toast CSS.
+    toast.style.pointerEvents = "auto";
+    toast.style.visibility = "visible";
+    toast.inert = false;
+    clearTimeout(state.toastTimer);
+    state.toastTimer = setTimeout(hideToast, 15000);
   }
 
   async function loadCounts() {
@@ -170,6 +203,37 @@
     edit.setAttribute("aria-label", `Correct ${event.title}`);
     edit.addEventListener("click", () => toggleEditor(card, event));
     actions.append(edit);
+    const dismiss = node("button", "icon-button icon-button-danger", "×");
+    dismiss.type = "button";
+    dismiss.title = "Dismiss this event";
+    dismiss.setAttribute("aria-label", `Dismiss ${event.title}`);
+    dismiss.addEventListener("click", async () => {
+      if (dismiss.disabled) return;
+      dismiss.disabled = true;
+      dismiss.textContent = "…";
+      try {
+        const updated = await api(`/api/events/${event.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ status: "dismissed" }),
+        });
+        updateCard(card, updated);
+        showUndoToast("Event dismissed.", async () => {
+          await api(`/api/events/${event.id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ status: "upcoming" }),
+          });
+          await loadEvents();
+          await loadCounts();
+          showToast("Event restored.");
+        });
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        dismiss.disabled = false;
+        dismiss.textContent = "×";
+      }
+    });
+    actions.append(dismiss);
     if (state.view === "review") {
       const approve = node("button", "button button-green", "Approve");
       approve.type = "button";
@@ -188,20 +252,6 @@
         finally { approve.disabled = false; approve.textContent = "Approve"; }
       });
       actions.append(approve);
-      const hide = node("button", "icon-button", "×");
-      hide.type = "button";
-      hide.title = "Dismiss from this list";
-      hide.setAttribute("aria-label", "Dismiss event");
-      hide.addEventListener("click", async () => {
-        if (hide.disabled) return;
-        hide.disabled = true; hide.textContent = "…"; hide.setAttribute("aria-label", "Dismissing event");
-        try {
-          const updated = await api(`/api/events/${event.id}`, { method: "PATCH", body: JSON.stringify({ status: "dismissed" }) });
-          updateCard(card, updated); showToast("Event dismissed.");
-        } catch (error) { showToast(error.message); }
-        finally { hide.disabled = false; hide.textContent = "×"; hide.setAttribute("aria-label", "Dismiss event"); }
-      });
-      actions.append(hide);
     }
     top.append(actions);
     card.append(top);
@@ -274,7 +324,8 @@
       state.clubs = await api("/api/clubs");
       state.clubRows = state.clubs.map((club) => ({
         club,
-        searchText: `${club.name} ${club.instagram_username || ""}`.toLocaleLowerCase(),
+        searchText: `${club.name} ${[club.instagram_username, ...(club.accounts || "").split(",")]
+          .filter(Boolean).map((handle) => `@${handle.trim().replace(/^@/, "")}`).join(" ")}`.toLocaleLowerCase(),
         element: null,
       }));
       filterClubs();
@@ -284,7 +335,9 @@
 
   function filterClubs() {
     const search = $("#club-search").value.trim().toLocaleLowerCase();
-    state.clubMatches = state.clubRows.filter((row) => row.searchText.includes(search));
+    const unscrapedOnly = $("#club-unscraped").checked;
+    state.clubMatches = state.clubRows.filter((row) => row.searchText.includes(search) &&
+      (!unscrapedOnly || (/^[A-Za-z0-9_.]{1,30}$/.test(row.club.instagram_username || "") && !row.club.instagram_ever_checked)));
     state.clubPage = 0;
     renderClubPage();
   }
@@ -298,7 +351,7 @@
       row.element ||= renderClub(row.club);
       return row.element;
     }));
-    if (!total) $("#clubs").append(node("p", "empty-state", "No clubs match your search."));
+    if (!total) $("#clubs").append(node("p", "empty-state", "No clubs match your search and filters."));
     $("#club-directory-count").textContent = total
       ? `${start + 1}–${Math.min(start + CLUB_PAGE_SIZE, total)} of ${total} clubs`
       : "0 matching clubs";
@@ -353,20 +406,18 @@
   }
 
   async function loadStatus() {
+    if (state.statusLoading) return;
+    state.statusLoading = true;
     try {
       const progress = await api("/api/scan");
       const run = progress.run;
-      if (run?.kind === "full" && run.id && run.message !== "Discovering clubs" && state.clubRefreshRun !== run.id) {
-        state.clubRefreshRun = run.id;
-        await loadClubs();
-      }
+      const clubProgressKey = run?.id ? `${run.id}:${run.accounts_checked || 0}:${run.status}:${run.message === "Discovering clubs"}` : "";
       const indicator = $("#sync-indicator");
       indicator.classList.toggle("busy", progress.running);
       indicator.lastElementChild.textContent = progress.running ? "Scan in progress" : run?.finished_at ? `Updated ${new Date(run.finished_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "Ready to scan";
       const total = Object.values(progress.accounts || {}).reduce((sum, value) => sum + value, 0);
-      const checked = (progress.accounts?.ok || 0) + (progress.accounts?.partial || 0);
+      const checked = progress.accounts_checked ?? ((progress.accounts?.ok || 0) + (progress.accounts?.partial || 0));
       $("#stat-checked").textContent = total ? `${checked} / ${total}` : "0";
-      await loadCounts();
       const missing = progress.missing_handles || 0;
       let message = run?.message || "No scan has run yet. Start one to discover clubs and check Instagram.";
       if (progress.running && run) message = `${run.message || "Scanning"} · ${run.accounts_checked || 0} of ${run.accounts_total || 0} accounts checked · ${run.posts_seen || 0} posts read.`;
@@ -376,7 +427,11 @@
       if (missing) message += ` ${missing} club listings still need an Instagram handle.`;
       if (progress.accounts?.error) message += ` ${progress.accounts.error} accounts need attention.`;
       $("#scan-message").textContent = message;
+      const refreshClubs = clubProgressKey && run.message !== "Discovering clubs" && state.clubRefreshRun !== clubProgressKey;
+      await Promise.allSettled([loadCounts(), ...(refreshClubs ? [loadClubs()] : [])]);
+      if (refreshClubs) state.clubRefreshRun = clubProgressKey;
     } catch (_) { $("#scan-message").textContent = "The local scan status is not available yet."; }
+    finally { state.statusLoading = false; }
   }
 
   function openClubForm(club = null) {
@@ -386,10 +441,37 @@
     $("#club-name").value = club?.name || "";
     $("#club-username").value = club?.instagram_username || "";
     $("#club-website").value = club?.website || "";
+    $("#remove-club").classList.toggle("hidden", !club);
     $("#club-name").focus();
   }
 
   function init() {
+    $("#import-events").addEventListener("click", () => $("#event-import-file").click());
+    $("#event-import-file").addEventListener("change", async (event) => {
+      const file = event.target.files[0];
+      if (!file) return;
+      const button = $("#import-events");
+      const status = $("#event-transfer-status");
+      button.disabled = true;
+      status.hidden = false;
+      status.textContent = "Importing events…";
+      try {
+        if (file.size > 10 * 1024 * 1024) throw new Error("Event files must be 10 MB or smaller.");
+        const result = await api("/api/events/import", { method: "POST", body: await file.text() });
+        status.textContent = `Imported ${result.imported} events. Skipped ${result.duplicates} existing events and ${result.past} past events.`;
+        state.view = "upcoming";
+        $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === state.view));
+        $("#review-sort-field").hidden = true;
+        $("#filters").reset();
+        await loadAll();
+        await loadCounts();
+      } catch (error) {
+        status.textContent = `Import failed: ${error.message}`;
+      } finally {
+        button.disabled = false;
+        event.target.value = "";
+      }
+    });
     $$(".tab").forEach((tab) => tab.addEventListener("click", () => {
       state.view = tab.dataset.view;
       $("#review-sort-field").hidden = state.view !== "review";
@@ -412,6 +494,20 @@
     });
     $("#add-club").addEventListener("click", () => openClubForm());
     $("#cancel-club").addEventListener("click", () => $("#club-form").classList.add("hidden"));
+    $("#remove-club").addEventListener("click", async (event) => {
+      const id = $("#club-edit-id").value;
+      if (!id) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        await api(`/api/clubs/${id}`, { method: "DELETE" });
+        $("#club-form").classList.add("hidden");
+        showToast("Club removed.");
+        await loadClubs();
+        await loadStatus();
+      } catch (error) { showToast(error.message); }
+      finally { button.disabled = false; }
+    });
     const pagination = node("nav", "club-pagination");
     pagination.id = "club-pagination";
     pagination.setAttribute("aria-label", "Club list pages");
@@ -433,6 +529,7 @@
     pagination.append(previous, pageNumbers, next);
     $("#clubs").after(pagination);
     $("#club-search").addEventListener("input", filterClubs);
+    $("#club-unscraped").addEventListener("change", filterClubs);
     $("#club-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const id = $("#club-edit-id").value;
@@ -443,7 +540,7 @@
       } catch (error) { showToast(error.message); }
     });
     loadAll();
-    state.refreshTimer = setInterval(loadStatus, 5000);
+    state.refreshTimer = setInterval(loadStatus, 2000);
   }
   document.addEventListener("DOMContentLoaded", init, { once: true });
 })();

@@ -30,7 +30,7 @@ def retry_plan(db_path, now=None) -> dict:
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     with connect(db_path) as db:
-        runs = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchall()
+        runs = db.execute("SELECT * FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 6").fetchall()
     empty = {"next_scan_at": "", "requires_login": False, "cooldown": False, "reason": ""}
     if not runs or runs[0]["status"] == "running" or not runs[0]["finished_at"]:
         return empty
@@ -42,6 +42,17 @@ def retry_plan(db_path, now=None) -> dict:
     if kind == "rate_limit":
         minutes = 6 * 60
         reason = "Automatic retry after the six-hour HTTP 429 cooldown"
+    elif kind == "temporary_limit":
+        consecutive = 0
+        for run in runs:
+            if failure_kind(run) != "temporary_limit":
+                break
+            consecutive += 1
+        minutes = min(360, 30 * 2 ** (consecutive - 1))
+        reason = f"Instagram requested a pause; automatic retry after {minutes} minutes"
+    elif kind == "authentication":
+        minutes = 360
+        reason = "Login needs attention; complete Instagram verification or sign in again. Automatic retry after six hours"
     elif failed:
         minutes = 1
         reason = "Automatic retry after the one-minute failure cooldown"

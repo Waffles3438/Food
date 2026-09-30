@@ -14,7 +14,9 @@ from foodfinder.progress import configure_progress_logging
 def main() -> int:
     parser = argparse.ArgumentParser(prog="foodfinder", description="U of T complimentary-food event finder")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    subcommands.add_parser("serve", help="start the local dashboard")
+    serve = subcommands.add_parser("serve", help="start the local dashboard")
+    serve.add_argument("--ignore-cooldown", action="store_true",
+                       help="start one scan immediately; subsequent scans respect cooldowns")
     login = subcommands.add_parser("login", help="log in to your own Instagram account")
     login.add_argument("--username", default="", help="required account identity when importing browser cookies")
     login.add_argument(
@@ -32,8 +34,10 @@ def main() -> int:
 
     if args.command == "serve":
         import uvicorn
+        from foodfinder.web import create_app
 
-        uvicorn.run("foodfinder.web:app", host=HOST, port=PORT, reload=False, access_log=False)
+        uvicorn.run(create_app(ignore_cooldown_once=args.ignore_cooldown),
+                    host=HOST, port=PORT, reload=False, access_log=False)
         return 0
     if args.command == "login":
         from foodfinder.instagram import interactive_login

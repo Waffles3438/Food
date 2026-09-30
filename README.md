@@ -1,89 +1,74 @@
 # U of T Free Food Finder
 
-A local dashboard that watches St. George student clubs' public Instagram posts and accessible Stories for upcoming events offering complimentary food. The dashboard runs only on your computer. It uses Instagram through the unofficial Instaloader library; Instagram may restrict access, challenge logins, or change its interfaces. Review the coverage and last-scan status in the app.
+A dashboard for free food events posted by University of Toronto St. George clubs. It runs on your computer and checks public Instagram posts and Stories your account can access.
 
-## Quick start (Windows)
+## Set it up on Windows
 
-1. Install 64-bit Python 3.11, 3.12, or 3.13 from [python.org](https://www.python.org/downloads/windows/), and select **Add python.exe to PATH**. Codex desktop's bundled CPython runtime is also detected if available.
-2. Double-click `setup.ps1` from PowerShell, or run `powershell -ExecutionPolicy Bypass -File .\setup.ps1`. Setup creates `.venv` and installs the app and OCR dependencies. It detects Intel Arc graphics and installs the Intel GPU (XPU) build of PyTorch; otherwise it installs the CPU build. An existing XPU installation is preserved. PyTorch and the English OCR models require a sizeable one-time download.
-3. Run `powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1` and sign in to an Instagram account you control. Instagram may ask for two-factor verification. The password is not stored; Instaloader stores its reusable session outside this repository in its user config directory.
-   If Instagram rejects the direct login but you can sign in through a browser, first finish any Instagram security prompts there, then import that browser session explicitly, for example `powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1 -BrowserCookie firefox`. Supported browser names include `edge`, `chrome`, and `firefox`. This reads Instagram cookies from the selected browser and saves the resulting session in the app's local data folder. Recent Chrome on Windows may prevent external tools from decrypting its cookies; if that happens, keep Chrome's encryption enabled and use Firefox for the import instead.
-4. Run `powershell -ExecutionPolicy Bypass -File .\start.ps1` and open `http://127.0.0.1:8000`.
-5. Select **Scan now** to discover clubs and start a scan. Scans continue in the background and preserve progress if interrupted; remaining accounts are picked up at the next scheduled scan. The app schedules a scan every six hours while it is running; club-directory discovery refreshes weekly.
+1. Install 64-bit [Python 3.12](https://www.python.org/downloads/windows/).
+2. Download this project from GitHub using **Code → Download ZIP**, then extract the folder. Or clone it with Git:
 
-OCR weights download from EasyOCR's model host on first use and are cached locally. Use `--help` with `.venv\Scripts\python.exe -m foodfinder` for the command-line tools.
+   ```powershell
+   git clone https://github.com/Waffles3438/Food.git
+   cd Food
+   ```
 
-Keep the PowerShell window open to follow timestamped scan progress. It shows directory pages and club profiles, the current account number, post links, caption-only decisions, image downloads, OCR device and image number, Instagram pacing waits, and a final summary. Post counts also update in the dashboard as each post is saved. If an operation has no new progress for 30 seconds, the terminal repeats its last activity with the elapsed time; that means the process is still running, not that the request has succeeded. Scan messages do not print passwords, session cookies, or post captions. Use **Ctrl+C** in the PowerShell window to stop the app; saved results remain available.
+3. Open PowerShell in the `Food` folder and run:
 
-To import a specific browser account, run `./login-instagram.ps1 -BrowserCookie firefox -Username uoftfoodscraper` after signing into that account in Firefox. The import checks the account identity before saving and refuses a different account. Only unexpired Instagram cookies are imported; failed verification leaves the saved session unchanged.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1
+   ```
 
-## What it can access
+   Setup installs the app and image-reading tools. The first setup can take a while because it downloads these packages and models.
 
-- The app walks all 36 pages currently linked by the University of Toronto Student Organization Portal and keeps St. George entries. It also reads the UTSU club directory. Clubs without an Instagram handle can be linked manually from **Clubs & scans**.
-- Posts are checked caption-first. A clear complimentary-food offer with a date, time, and location skips image downloads and OCR. Food or event captions missing these details get image OCR, including all carousel images and Reel covers, using an available Intel GPU with CPU fallback. Empty captions and accessible Stories still get image OCR. Unrelated captions skip images, so offers mentioned only in those images can be missed. Audio is not transcribed.
-- Repeat scans fetch timeline entries to discover new posts and compare captions. Successfully processed, unchanged post IDs skip downloads, OCR, and event extraction. Edited captions are processed again, reusing successful saved image text when available. Incomplete reads are retried. Stories with saved successful IDs and unchanged captions also skip media processing; saved event evidence stays available. Post counts for each scan count newly processed or edited posts, not cached skips; the terminal logs skips explicitly.
-- Existing records from before this cache update are processed once more because they did not record whether OCR succeeded. The cache is saved after each processed source, so later interruptions retain completed work. Image-only changes under the same post ID are not detected by caption comparisons. The scanner still inspects up to 100 entries rather than stopping at the first saved or old post, since pinned and collaborative posts can appear out of date order.
-- Collection starts with Instaloader's authenticated post-timeline query. It does not call `Profile.from_username()` or `web_profile_info` before reading posts: that profile endpoint has returned immediate 429 responses even on single-account checks. Pagination and rate management still use Instaloader. The query matches the pinned 4.15.3 release; Instagram can change it or refuse access.
-- Stories use the requested club's account ID from its timeline. Empty or restricted timelines that supply no ID are marked as incomplete Story coverage. Collaborative posts never cause the app to check another organizer's Stories.
-- Stories are checked for accounts available to the signed-in user. A Story's media is saved locally as evidence when a matching event is detected, though its Instagram link may expire. Scans happen every six hours, so Stories that disappear between scans may be missed.
-- Collection inspects up to 100 timeline entries per club account, reading posts published in the last 60 days. Old pinned posts are skipped without hiding newer announcements. Reaching the limit is reported as partial coverage. Private, inactive, inaccessible, or Instagram-restricted accounts cannot be guaranteed.
-- Reposts with very similar event titles on the same date share one dashboard card, even across different Instagram accounts. Case and punctuation are ignored, and small OCR differences are tolerated. The card retains the distinct source links. Corrections and dismissals apply to the matching group. Events from the same account with an identical date and time also share a card.
-- An undated repost joins a dated event when its title is at least 96% similar after ignoring case and punctuation, has at least two words and ten characters, and matches exactly one dated group. Conflicting known times prevent this match. The combined card uses the dated event's details and keeps all source links; the undated copy no longer appears separately in Needs review. Ambiguous matches stay in Needs review. This also applies to future scans.
-- Paid or members-only events with complimentary food appear as well. Entry costs and restrictions are shown separately. Uncertain food or event dates appear in **Needs review**.
+4. Sign in to Instagram:
 
-Events with a confirmed date are automatically dismissed after their stated end time; when no end time is known, they are dismissed after that calendar day. Past events are dismissed on app startup and during background scanning, including events previously left in Needs review. Events without a reliable date stay available for review. All event dates use the `America/Toronto` time zone. Date-only results show no guessed time. Relative dates are based on the source post. When a calendar date omits its year, the post timestamp in Toronto supplies the year. No event date is rolled forward into another year to make it appear upcoming. Explicit event dates in the caption take priority over image dates; where separately described activities have their own dates, dates in the food-offer paragraph take priority. Duration text such as "4-16 month" is not treated as a date.
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\login-instagram.ps1
+   ```
 
-## Privacy and local data
+   Sign in with an account you control and complete any Instagram verification prompts. Your password is not saved.
 
-The SQLite database is saved under `%LOCALAPPDATA%\UofTFreeFoodFinder\foodfinder.sqlite3`; OCR downloads use EasyOCR's local model cache. Post images are used temporarily for OCR and are discarded. Story media is saved only when an event detection needs evidence. Nothing is sent to a hosted AI service. `.gitignore` excludes the SQLite file, collected media, Instagram sessions, Python environments, and OCR weights.
+5. Start the app:
 
-## Troubleshooting
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\start.ps1
+   ```
 
-- **Automatic recovery:** Keep the app open. Failed or interrupted scans automatically start a fresh scan after one minute, including consecutive failures. HTTP 429 rate limits instead wait six hours. Saved history determines the delay across app restarts; unchecked accounts stay first in the queue. Successful runs restore the normal six-hour cadence. The terminal and dashboard display the next retry time. The scheduler checks every 10 seconds, and missed intervals produce one catch-up scan.
-- **Error details:** New scan failures retain the category, exception type, and recognizable HTTP status without retaining raw error responses or session data. Older ambiguous access errors use the one-minute delay unless the saved message identifies HTTP 429.
+   The dashboard opens at [http://127.0.0.1:8000](http://127.0.0.1:8000). Keep the PowerShell window open while using it.
 
-- **Python was not found:** Install Python 3.11 or newer and reopen PowerShell.
-- **No session / expired login:** Run `login-instagram.ps1` again. Do not paste your Instagram password into the dashboard.
-- **Login challenge or throttling:** Complete login challenges in your browser, reimport the session, then select **Scan now**. Authentication failures also retry after one minute, but may still need you to complete verification or reimport the session. A 429 stops the current queue, including when it occurs during media downloads. HTTP 429 waits six hours; other failures, including please-wait restrictions and access refusals, wait one minute. Each individual request still gets only one attempt. **Scan now** respects active retry delays. Six hours is the app's retry interval, not a promise that Instagram will allow access then.
-- **Missing poster text:** A media-download failure preserves the caption and marks the account as partially checked. A missing or malformed timeline is reported as a failure rather than a successful empty feed.
-- **OCR initialization or image-reading failure:** The caption and any successfully read poster text are retained, and coverage is marked partial. Model-download progress output is disabled.
-- **401 with “please wait”:** This is treated as a temporary access restriction, rather than proof that the session expired. Collection stops. Finish any prompts in the browser for the same scraper account before reimporting its session.
-- **OCR did not load:** Confirm setup finished and run `setup.ps1` again. PyTorch and the OCR models may take several minutes to download.
-- **No events yet:** Add missing club handles under **Clubs & scans**, scan again, and check **Needs review**. Detection is heuristic; it is not a guarantee of event availability.
+## Use the app
 
-## Food keywords
+- Select **Scan now** to check clubs. The app also scans about every six hours while it is open.
+- The dashboard shows upcoming food events, events that need review, and scan progress.
+- Use **Clubs & scans** to search by club name or Instagram handle (with or without `@`), see account status, or add a missing handle.
+- Click a club's pencil, then **Remove club** to remove it from the directory and future scans. Directory refreshes will not add it back; saved events remain available.
+- Select **Not scraped yet · valid Instagram handle** to show clubs with a correctly formatted handle that have never been successfully checked. Failed attempts remain included; accounts successfully checked before a later error are excluded. This filter works with club search and does not verify account existence on Instagram.
+- Press **Ctrl+C** in the PowerShell window to stop the app. Saved results remain available next time.
 
-The shared list in `foodfinder/food_keywords.py` includes hamburgers/burgers, BBQ/barbecue, cookies, pizza, hot dogs, donuts/doughnuts, pastries, bagels, muffins, cupcakes, brownies, sandwiches, wraps, tacos, burritos, sushi, dumplings, noodles, pasta, fries, poutine, popcorn, chips, ice cream, candy, fruit, coffee, tea, bubble tea/boba, hot chocolate, juice, lemonade, drinks, snacks, refreshments, and meals. Singular/plural forms and spelling variants are listed explicitly; edit that file and restart the app to extend it.
+### Import and export events
 
-Matching is case-insensitive. Examples include `free hamburger`, `FREE COOKIES!`, `complimentary BBQ`, `pizza included with admission`, and `#FreeCookies`. A food keyword alone prompts image inspection but does not prove the food is complimentary. `Free cookies!` without a date is retained in **Needs review** if image OCR cannot resolve it. Negated offers, dietary phrases such as `gluten-free pizza`, and unrelated offers such as `free play` are not treated as confirmed free food. Food that is merely "available" needs review. Missing admission or membership details remain unspecified.
+Use **Export upcoming** above the event tabs to download all upcoming events as a JSON file, regardless of the selected tab or filters. **Import events** loads that file into this app or another copy of Free Food Finder. Details, captions, club labels, and supporting source links are included; saved images, local file paths, and Instagram sessions are excluded.
 
-## Intel GPU OCR
+Import adds events without replacing existing records. Existing event IDs (including dismissed events) and past dates are skipped, and the result shows how many were imported or skipped. Invalid files are rejected without importing any events. Files can contain up to 5,000 events and must be at most 10 MB. Newly imported accounts are paused, so importing a list does not start Instagram scans.
 
-Run `powershell -ExecutionPolicy Bypass -File .\setup.ps1 -TorchBackend xpu` to explicitly install Intel GPU support. The pinned PyTorch 2.7.1 XPU build supports Intel Arc graphics on Windows with a compatible graphics driver. Hardware detection alone does not guarantee driver or OCR compatibility; the app checks GPU availability at runtime.
+The scanner reads captions first and checks images when event or food details are missing. It uses an available Intel GPU for image reading when supported, with CPU fallback. Scans inspect up to 100 recent timeline entries from the last 60 days. Stories may disappear before a scan can read them.
 
-`FOODFINDER_OCR_DEVICE` defaults to `auto`, which uses Intel XPU when available and CPU otherwise. To force CPU for a launch, set `$env:FOODFINDER_OCR_DEVICE = "cpu"` in PowerShell before running `start.ps1`. Use `"auto"` to restore automatic selection. `.env.example` documents these settings but is not loaded automatically.
+Future scans check feeds for new posts and Stories, then skip anything already successfully scraped, even if its caption changes. This history survives restarts. Failed or incomplete reads are retried; saved events and manual edits are kept.
 
-EasyOCR 1.7.2 assumes CUDA in its GPU model loader, so the app loads unquantized models on CPU and moves both text detection and recognition to Intel XPU. A GPU initialization or image-processing failure logs a warning and falls back to CPU; the affected image is retried. If CPU also fails, the existing partial-coverage reporting applies. This speeds up local image processing when supported; Instagram request limits still apply.
+Accounts are checked once per pass before any are checked again, with accounts never successfully scraped first. Pauses and restarts resume the unfinished pass. Failed attempts count as a turn and can be retried in the next pass; Instagram restrictions still pause the queue. Newly linked accounts join the unfinished pass.
 
-Optional GPU image batching is controlled by `$env:FOODFINDER_OCR_BATCH_SIZE = "4"` (range 1-16; default 1). It batches text detection across images from the same post/carousel or Story, then recognizes text in image order. It does not combine different posts or send parallel Instagram requests. Mixed image sizes are padded with white space rather than stretched. Batches above 16 million padded pixels, or batches that fail, are retried as individual images; CPU fallback remains available. The terminal shows batch progress when enabled.
+## Instagram limits
 
-The default stays at **1** because it was fastest on this computer. The Intel Arc 140V benchmark used eight generated posters of mixed 1080x1080 and 1080x1350 sizes, warm-up passes, and two timed passes per setting:
+Network and other ordinary failures retry after one minute. Instagram “please wait” restrictions wait 30 minutes, doubling after repeated restrictions up to six hours. HTTP 429 and login failures wait six hours. Cooldowns survive restarts. Complete any Instagram verification prompts or sign in again for login failures. The dashboard shows the next retry time.
 
-| Images per batch | Average time for eight posters | Peak allocated GPU memory |
-| --- | --- | --- |
-| 1 | 7.75 seconds | 1,211 MiB |
-| 4 | 8.75 seconds | 4,551 MiB |
-| 8 | 8.88 seconds | 9,005 MiB |
+“Total scraped accounts” counts accounts successfully checked at least once across all scans. It refreshes every two seconds and increases when a previously unchecked account is successfully scraped. Rescanning an account does not count it twice, and later errors do not reduce the total. Current errors remain visible under Clubs & scans.
 
-All settings returned identical text and ran on XPU, with detector batch dimensions verified during inference. These are local fixture measurements, not an estimate for all Instagram posts; image size, padding, and poster complexity affect throughput. More GPU memory allowed larger batches but did not make these images faster.
+After refreshing your Instagram session, you can explicitly skip the saved wait for one scan. Stop the running app with **Ctrl+C**, then run `./start.ps1 -IgnoreCooldown`. This starts a scan immediately; if Instagram restricts it again, the scan stops and normal cooldowns apply to subsequent retries. It does not clear Instagram's own restrictions.
 
-## Development
+If PowerShell says port 8000 is already in use, the app may already be running. Open [http://127.0.0.1:8000](http://127.0.0.1:8000) instead of starting another copy.
 
-```powershell
-& .\.venv\Scripts\python.exe -m unittest discover -s tests -v
-& .\.venv\Scripts\python.exe -m foodfinder discover
-& .\.venv\Scripts\python.exe -m foodfinder login
-& .\.venv\Scripts\python.exe -m foodfinder scan
-```
+## Your data
 
-The application defaults to a loopback-only HTTP listener (`127.0.0.1:8000`). Do not expose it to a public network: it is a personal, local-use tool.
+The database and Instagram session are kept on your computer, outside this project folder. Post images are used temporarily for text reading; images saved from Stories are kept as event evidence. The app does not send images to a hosted AI service. Do not share your Instagram session files.
+
+All event times use Toronto time. Times from 1 to before 9 without AM/PM default to PM; explicit AM/PM is respected. The scanner can miss events or misread posters, so confirm uncertain details under **Needs review**.

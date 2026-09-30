@@ -137,6 +137,21 @@ def initialize(db_path: Path | str | None = None) -> None:
             """
         )
         existing_event_columns = {row["name"] for row in db.execute("PRAGMA table_info(events)")}
+        club_columns = {row["name"] for row in db.execute("PRAGMA table_info(clubs)")}
+        if "removed" not in club_columns:
+            db.execute("ALTER TABLE clubs ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
+        account_columns = {row["name"] for row in db.execute("PRAGMA table_info(accounts)")}
+        if "ever_checked" not in account_columns:
+            db.execute("ALTER TABLE accounts ADD COLUMN ever_checked INTEGER NOT NULL DEFAULT 0")
+            # Recover only coverage supported by saved successes or downloaded sources.
+            db.execute("""UPDATE accounts SET ever_checked=1
+                          WHERE status IN ('ok','partial')
+                          OR EXISTS (SELECT 1 FROM sources WHERE sources.account_id=accounts.id)""")
+        if "last_scan_pass" not in account_columns:
+            db.execute("ALTER TABLE accounts ADD COLUMN last_scan_pass INTEGER NOT NULL DEFAULT 0")
+            # Finish the initial coverage pass before revisiting saved successes.
+            db.execute("UPDATE accounts SET last_scan_pass=1 WHERE ever_checked=1")
+        db.execute("INSERT OR IGNORE INTO kv(key,value) VALUES ('instagram_scan_pass','1')")
         if "eligibility" not in existing_event_columns:
             db.execute("ALTER TABLE events ADD COLUMN eligibility TEXT NOT NULL DEFAULT ''")
         scan_columns = {row["name"] for row in db.execute("PRAGMA table_info(scan_runs)")}
@@ -182,6 +197,9 @@ def upsert_club(
 ) -> str:
     now = utcnow()
     existing = db.execute("SELECT * FROM clubs WHERE source_key = ?", (source_key,)).fetchone()
+    # Keep a tombstone so directory refreshes cannot revive a removed club.
+    if existing and existing["removed"]:
+        return str(existing["id"])
     if existing:
         sources = set(json.loads(existing["sources_json"] or "[]"))
         if source_key not in sources:

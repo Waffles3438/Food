@@ -16,6 +16,7 @@ from fastapi.templating import Jinja2Templates
 from fastapi import Request
 
 from foodfinder.database import connect, initialize
+from foodfinder.event_transfer import MAX_BYTES, export_events, import_events
 from foodfinder.progress import configure_progress_logging, report
 from foodfinder.retry import retry_plan
 from foodfinder.scanner import (
@@ -26,6 +27,7 @@ from foodfinder.scanner import (
     list_clubs,
     list_events,
     patch_event,
+    remove_club,
     scan_progress,
     upsert_manual_club,
 )
@@ -60,7 +62,7 @@ def _scan_cooldown_active(db_path: Path | str, now: datetime | None = None) -> b
     return retry_plan(db_path, now=now)["cooldown"]
 
 
-async def _scheduler(app: FastAPI) -> None:
+async def _scheduler(app: FastAPI, *, ignore_cooldown_once: bool = False) -> None:
     """Resume transient failures automatically, respecting persisted backoff."""
     announced = None
     while True:
@@ -70,7 +72,13 @@ async def _scheduler(app: FastAPI) -> None:
                 report(f"Automatically dismissed {count} expired event(s).")
             with connect(app.state.db_path) as db:
                 latest = db.execute("SELECT id,status,finished_at FROM scan_runs ORDER BY started_at DESC, rowid DESC LIMIT 1").fetchone()
-            if latest is None:
+            if ignore_cooldown_once:
+                # Consume before launch so a failure cannot create a retry loop.
+                ignore_cooldown_once = False
+                if latest is None or latest["status"] != "running":
+                    report("Startup override: ignoring the saved cooldown for one scan. Subsequent retries will respect cooldowns.")
+                    launch_scan(app.state.db_path)
+            elif latest is None:
                 launch_scan(app.state.db_path)
             elif latest["status"] != "running" and latest["finished_at"]:
                 plan = retry_plan(app.state.db_path)
@@ -90,7 +98,8 @@ async def _scheduler(app: FastAPI) -> None:
         await asyncio.sleep(10)
 
 
-def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = True) -> FastAPI:
+def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = True,
+               ignore_cooldown_once: bool = False) -> FastAPI:
     database = str(db_path or database_path())
 
     @asynccontextmanager
@@ -101,7 +110,7 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
         _recover_orphaned_run(database)
         scheduler_task = None
         if start_scheduler:
-            scheduler_task = asyncio.create_task(_scheduler(app))
+            scheduler_task = asyncio.create_task(_scheduler(app, ignore_cooldown_once=ignore_cooldown_once))
         try:
             yield
         finally:
@@ -177,6 +186,31 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
     def counts():
         return event_counts(database)
 
+    @app.get("/api/events/export")
+    def download_events():
+        return Response(
+            content=json.dumps(export_events(database), ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="upcoming-events-{datetime.now().date().isoformat()}.json"',
+                     "Cache-Control": "no-store"},
+        )
+
+    @app.post("/api/events/import")
+    async def upload_events(request: Request):
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > MAX_BYTES:
+                raise HTTPException(413, "Event files must be 10 MB or smaller.")
+            body.extend(chunk)
+        try:
+            payload = json.loads(body.decode("utf-8-sig"))
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            raise HTTPException(422, "Choose a valid JSON event export.") from exc
+        try:
+            return import_events(payload, database)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.get("/api/events/{event_id}")
     async def event_detail(event_id: str):
         result = get_event(event_id, database)
@@ -238,6 +272,14 @@ def create_app(*, db_path: Path | str | None = None, start_scheduler: bool = Tru
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.delete("/api/clubs/{club_id}", status_code=204)
+    async def delete_club(club_id: str):
+        try:
+            remove_club(club_id, database)
+        except KeyError as exc:
+            raise HTTPException(404, "Club not found.") from exc
+        return Response(status_code=204)
 
     @app.get("/api/scan")
     async def scan_status():
